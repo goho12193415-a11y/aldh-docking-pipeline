@@ -1,0 +1,16 @@
+name: serine_hydrolase
+display_name: 丝氨酸水解酶
+status: audit_only
+description: 为丝氨酸亲核体、酸碱残基和氧阴离子穴提供模板接口；当前仅支持准备与审计。
+required_roles:
+  catalytic_residue:
+    residue_names: [SER]
+    required_atoms: [OG]
+  acid_base_residue:
+    residue_names: [HIS, ASP, GLU]
+    required_atoms: [N, OD1, OE1]
+box_strategy: catalytic_residue_center
+scoring_strategy: template_audit_only
+interpretation_limits:
+  - Standard ALDH scoring must not be used for this mechanism.
+  - Reaction-state and protonation validation are still required.

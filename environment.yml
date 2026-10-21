@@ -1,0 +1,16 @@
+name: aldh-docking
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - rdkit
+  - openbabel
+  - biopython
+  - "numpy<2"
+  - pandas
+  - pyyaml
+  - requests
+  - gemmi
+  - pip
+  - pip:
+      - meeko>=0.6

@@ -1,0 +1,16 @@
+name: aldh
+display_name: 醛脱氢酶（ALDH）
+status: implemented
+description: 催化半胱氨酸与醛底物反应，并由 NAD 类辅因子参与电子转移。
+required_roles:
+  catalytic_residue:
+    residue_names: [CYS]
+    required_atoms: [SG]
+  cofactor:
+    residue_names: [NAD, NAP, NDP]
+    required_atoms: [C4N, C4]
+box_strategy: catalytic_residue_to_cofactor_midpoint
+scoring_strategy: aldh_nucleophile_carbonyl_hydride_geometry
+interpretation_limits:
+  - Vina affinity is not a reaction barrier or binding free energy.
+  - Catalytic geometry is not proof of covalent chemistry.

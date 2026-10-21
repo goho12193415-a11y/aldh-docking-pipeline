@@ -1,0 +1,16 @@
+name: cysteine_protease
+display_name: 半胱氨酸蛋白酶
+status: audit_only
+description: 为催化半胱氨酸、组氨酸和酸性残基提供模板接口；当前仅支持准备与审计。
+required_roles:
+  catalytic_residue:
+    residue_names: [CYS]
+    required_atoms: [SG]
+  acid_base_residue:
+    residue_names: [HIS]
+    required_atoms: [ND1, NE2]
+box_strategy: catalytic_residue_center
+scoring_strategy: template_audit_only
+interpretation_limits:
+  - Standard ALDH carbonyl/NAD geometry must not be used for this mechanism.
+  - Covalent reaction modeling requires a specialized workflow.

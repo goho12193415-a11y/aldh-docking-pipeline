@@ -1,0 +1,13 @@
+name: metalloenzyme
+display_name: 金属酶
+status: audit_only
+description: 为金属中心、配位残基和保守水提供模板接口；当前不替代专用金属参数化。
+required_roles:
+  metal_center:
+    residue_names: [ZN, MG, FE, MN, CA, CU, NI, CO]
+    required_atoms: []
+box_strategy: metal_center
+scoring_strategy: template_audit_only
+interpretation_limits:
+  - Metal coordination and charge states require specialized validation.
+  - Standard Vina scores must not be interpreted as metal-binding thermodynamics.
