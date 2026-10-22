@@ -8,6 +8,7 @@ dependencies:
   - biopython
   - "numpy<2"
   - pandas
+  - scipy
   - pyyaml
   - requests
   - gemmi
