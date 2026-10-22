@@ -233,7 +233,7 @@ class Interactive3DPocketWindow(tk.Toplevel):
 
 
 class DockingWorkbench(tk.Tk):
-    """Interactive 4-page scientific workbench for the Universal ALDH & Enzyme Docking Pipeline v3.0."""
+    """Interactive scientific workbench for the Universal ALDH & Enzyme Docking Pipeline v4.0."""
 
     COLORS = {
         "navy": "#10233F",
@@ -252,7 +252,7 @@ class DockingWorkbench(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("通用酶与分子对接全自动工作台 v3.0")
+        self.title("通用酶与分子对接全自动工作台 v4.0")
         self.geometry("1260x820")
         self.minsize(1040, 680)
         self.process: subprocess.Popen[str] | None = None
@@ -334,7 +334,7 @@ class DockingWorkbench(tk.Tk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         tk.Label(sidebar, text="UNIVERSAL", bg=self.COLORS["navy"], fg=self.COLORS["white"], font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=24, pady=(26, 0))
-        tk.Label(sidebar, text="全自动分子对接工作台 v3.0", bg=self.COLORS["navy"], fg="#8FB5D8", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
+        tk.Label(sidebar, text="全自动分子对接工作台 v4.0", bg=self.COLORS["navy"], fg="#8FB5D8", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
         nav_items = [
             ("quick", "01  快速实验"),
             ("prep", "02  结构与化学准备"),
@@ -913,7 +913,7 @@ class DockingWorkbench(tk.Tk):
             return
         data = json.loads(cov_path.read_text(encoding="utf-8"))
         top = tk.Toplevel(self)
-        top.title("14 项全流程自动化覆盖矩阵 (v3.0)")
+        top.title("14 项全流程自动化覆盖矩阵 (v4.0)")
         top.geometry("780x460")
         tree = ttk.Treeview(top, columns=("item", "status", "external"), show="headings")
         tree.heading("item", text="模块项")
