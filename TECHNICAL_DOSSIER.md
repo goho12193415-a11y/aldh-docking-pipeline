@@ -29,5 +29,5 @@
 
 ## 2. Verification & Validation Summary
 - **Unit Test Suite**: `python3 -m unittest discover -s tests -v` — **37 / 37 tests pass**.
-- **Pipeline End-to-End Execution**: `python3 main.py --config config/pipeline_config.yaml --workers 2` — completes all 8 stages and writes SQLite run history (`reports/run_history.sqlite3`), CSV summaries, interactive HTML report, and PyMOL visualization scripts.
+- **Pipeline End-to-End Execution**: `python3 main.py --config config/pipeline_config.yaml --workers 2` — completes the configured stages and writes SQLite run history (`reports/run_history.sqlite3`), CSV/JSON summaries, optional workflow artifacts, and PyMOL visualization scripts. The current repository does **not** generate an interactive HTML report; GUI results are provided through the Tkinter result table and interactive 3D pocket viewer.
 - **Artifact Integrity Check**: `python3 scripts/validate_outputs.py` — passes with zero missing outputs.
