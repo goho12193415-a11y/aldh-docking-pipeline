@@ -19,6 +19,7 @@ from .common import (
     atom_dict,
     distance,
     enumerate_ph_protonation_states,
+    enumerate_stereoisomers_and_tautomers,
     parse_smiles_tokens,
     require_executable,
     standardize_and_desalt_smiles,
@@ -124,6 +125,7 @@ def assess_ligand_chemical_state(name: str, smiles: str, ph: float = 7.4) -> dic
 
     desalt_info = standardize_and_desalt_smiles(smiles)
     protonation_states = enumerate_ph_protonation_states(smiles, ph=float(ph))
+    stereo_tautomer_states = enumerate_stereoisomers_and_tautomers(smiles)
 
     if HAS_RDKIT:
         from rdkit import Chem
@@ -183,6 +185,7 @@ def assess_ligand_chemical_state(name: str, smiles: str, ph: float = 7.4) -> dic
         "stripped_counterions": desalt_info["stripped_counterions"],
         "was_desalted": desalt_info["was_desalted"],
         "enumerated_protonation_states": protonation_states,
+        "enumerated_stereoisomers_and_tautomers": stereo_tautomer_states,
         "auto_remediated": True,
         "remediated_status": "auto_standardized_and_enumerated" if flags else "single_neutral_state_candidate",
         "experimental_ph": float(ph),
@@ -783,6 +786,48 @@ def compute_pose_rmsd(pose_a_pdb: Path, pose_b_pdb: Path, symmetry_corrected: bo
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         sq_errors.extend(float(cost_matrix[r, c]) for r, c in zip(row_ind, col_ind))
     return round(float(np.sqrt(np.mean(sq_errors))), 4)
+
+
+def evaluate_redocking_control(
+    cocrystal_pdb: Path,
+    docked_pose_pdb: Path,
+    rmsd_threshold_A: float = 2.0,
+    output_json: Path | None = None,
+) -> dict:
+    """Validate whether a docked pose reproduces the experimental co-crystal ligand geometry within rmsd_threshold_A (default 2.0 A) using Hungarian symmetry-corrected 3D RMSD."""
+    if not cocrystal_pdb.is_file() or not docked_pose_pdb.is_file():
+        result = {
+            "evaluated": False,
+            "reason": "missing_cocrystal_or_docked_pdb",
+            "cocrystal_pdb": str(cocrystal_pdb),
+            "docked_pose_pdb": str(docked_pose_pdb),
+        }
+    else:
+        rmsd = compute_pose_rmsd(cocrystal_pdb, docked_pose_pdb, symmetry_corrected=True)
+        raw_rmsd = compute_pose_rmsd(cocrystal_pdb, docked_pose_pdb, symmetry_corrected=False)
+        if rmsd is None:
+            result = {
+                "evaluated": False,
+                "reason": "atom_count_or_topology_mismatch",
+                "cocrystal_pdb": str(cocrystal_pdb),
+                "docked_pose_pdb": str(docked_pose_pdb),
+            }
+        else:
+            passed = bool(rmsd <= float(rmsd_threshold_A))
+            result = {
+                "evaluated": True,
+                "cocrystal_pdb": str(cocrystal_pdb),
+                "docked_pose_pdb": str(docked_pose_pdb),
+                "symmetry_corrected_rmsd_A": round(float(rmsd), 4),
+                "uncorrected_rmsd_A": round(float(raw_rmsd), 4) if raw_rmsd is not None else None,
+                "threshold_A": float(rmsd_threshold_A),
+                "passed_redocking_gate": passed,
+                "status": "passed_crystallographic_reproduction" if passed else "exceeded_rmsd_threshold",
+            }
+    if output_json is not None:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
 
 
 def aggregate_replicates(rows: list[dict], output_csv: Path) -> list[dict]:

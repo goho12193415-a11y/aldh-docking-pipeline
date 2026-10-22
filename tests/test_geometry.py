@@ -10,22 +10,29 @@ from src.common import (
     PDBParser,
     compute_peoe_charges,
     enumerate_ph_protonation_states,
+    enumerate_stereoisomers_and_tautomers,
     estimate_receptor_microenvironment_pka,
     parse_smiles_tokens,
+    generate_fallback_3d_coords,
     standardize_and_desalt_smiles,
+    write_fallback_pdbqt,
 )
 from src.mechanism_templates import list_supported_mechanisms, load_mechanism_template, mechanism_capability
-from src.step10_evaluation import _enrichment_factor, _pr_auc, _roc_auc
-from src.step1_ligand_prep import prepare_polysaccharide_conformers
+from src.step10_evaluation import _bedroc, _enrichment_factor, _pr_auc, _roc_auc, evaluate_experimental_data
+from src.step6_interaction_viz import analyze_interactions
+from src.step1_ligand_prep import enumerate_ligand_variants, prepare_polysaccharide_conformers, prepare_ring_conformer_ensemble
 from src.step2_receptor_prep import (
     detect_bridging_waters,
     prepare_flexible_receptor_pdbqt,
     prepare_receptor,
     reconstruct_missing_sidechains,
+    extract_cocrystal_ligand,
+    superimpose_receptor_kabsch,
     transplant_cofactor,
 )
 from src.step3_box_locator import discover_binding_pockets, locate_box, locate_mechanism_box
-from src.step5_mechanism_scorer import clean_ligand_pdbqt, parse_models, parse_models_and_flex, score_docking
+from src.step4_vina_runner import merge_conformer_pdbqt_outputs
+from src.step5_mechanism_scorer import clean_ligand_pdbqt, compute_physicochemical_rescore, parse_models, parse_models_and_flex, score_docking
 from src.step7_advanced import (
     aggregate_replicates,
     assess_enzyme_readiness,
@@ -38,10 +45,12 @@ from src.step7_advanced import (
     compute_pose_rmsd,
     detect_catalytic_cys,
     enforce_capability_gate,
+    evaluate_redocking_control,
 )
 from src.step8_dynamics import refine_active_pose_in_pocket, write_md_setup
 from src.step9_qmmm import write_qmmm_input
 from src.system_upgrade import (
+    aggregate_ensemble_results,
     audit_structure_repair,
     build_covalent_complex_and_manifest,
     build_engine_consensus_plan,
@@ -685,6 +694,245 @@ class GeometryTests(unittest.TestCase):
             assert naive_rmsd is not None and sym_rmsd is not None
             self.assertGreater(naive_rmsd, 1.5)
             self.assertEqual(sym_rmsd, 0.0)
+
+
+    def test_stereoisomer_and_tautomer_enumeration_expands_chiral_and_keto_enol(self):
+        # Unassigned chiral center in lactic acid CC(O)C(=O)O should expand into [C@H] and [C@@H] stereoisomers
+        iso_list = enumerate_stereoisomers_and_tautomers("CC(O)C(=O)O", max_isomers=8)
+        smiles_set = {item["smiles"] for item in iso_list}
+        self.assertTrue(any("@H" in s or "@" in s for s in smiles_set))
+        # Imidazole ring tautomerism and keto-enol tautomerism
+        taut_list = enumerate_stereoisomers_and_tautomers("CCC=O", max_isomers=8)
+        self.assertTrue(any(item["category"] == "tautomer" for item in taut_list))
+        variants = enumerate_ligand_variants("CC(O)C(=O)O", max_variants=8, ph=7.4)
+        self.assertGreaterEqual(len(variants), 3)
+
+    def test_ring_conformer_ensemble_generation_and_multi_model_pdbqt_merge(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdbqts, manifest = prepare_ring_conformer_ensemble("cyclohexane_carbaldehyde", "O=CC1CCCCC1", root / "confs", num_conformers=3)
+            self.assertEqual(len(pdbqts), 3)
+            self.assertTrue(manifest.is_file())
+            out1 = root / "conf1_out.pdbqt"
+            out2 = root / "conf2_out.pdbqt"
+            out1.write_text("\n".join([
+                "MODEL 1",
+                "REMARK VINA RESULT:   -6.10      0.000      0.000",
+                _pdb_atom("HETATM", 1, "C1", "UNL", "L", 1, 1.0, 1.0, 1.0, "C"),
+                "ENDMDL",
+            ]) + "\n", encoding="utf-8")
+            out2.write_text("\n".join([
+                "MODEL 1",
+                "REMARK VINA RESULT:   -7.40      0.000      0.000",
+                _pdb_atom("HETATM", 1, "C1", "UNL", "L", 1, 2.0, 2.0, 2.0, "C"),
+                "ENDMDL",
+            ]) + "\n", encoding="utf-8")
+            merged = merge_conformer_pdbqt_outputs([("conf1", out1), ("conf2", out2)], root / "merged_out.pdbqt")
+            models = parse_models(merged)
+            self.assertEqual(len(models), 2)
+            # Lowest energy (-7.40 from conf2) must be sorted first (MODEL 1)
+            self.assertAlmostEqual(float(models[0][0]["coord"][0]), 2.0, places=2)
+
+    def test_kabsch_receptor_superposition_and_boltzmann_ensemble_scoring(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ref_pdb = root / "ref.pdb"
+            mob_pdb = root / "mob.pdb"
+            out_pdb = root / "aligned.pdb"
+            ref_lines = [
+                _pdb_atom("ATOM", 1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 2, "CA", "GLY", "A", 2, 3.8, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 3, "CA", "SER", "A", 3, 3.8, 3.8, 0.0, "C"),
+                _pdb_atom("ATOM", 4, "CA", "CYS", "A", 4, 0.0, 3.8, 3.8, "C"),
+                "END",
+            ]
+            # Mobile receptor shifted by (+25.0, -15.0, +10.0)
+            mob_lines = [
+                _pdb_atom("ATOM", 1, "CA", "ALA", "A", 1, 25.0, -15.0, 10.0, "C"),
+                _pdb_atom("ATOM", 2, "CA", "GLY", "A", 2, 28.8, -15.0, 10.0, "C"),
+                _pdb_atom("ATOM", 3, "CA", "SER", "A", 3, 28.8, -11.2, 10.0, "C"),
+                _pdb_atom("ATOM", 4, "CA", "CYS", "A", 4, 25.0, -11.2, 13.8, "C"),
+                "END",
+            ]
+            ref_pdb.write_text("\n".join(ref_lines) + "\n", encoding="utf-8")
+            mob_pdb.write_text("\n".join(mob_lines) + "\n", encoding="utf-8")
+            info = superimpose_receptor_kabsch(mob_pdb, ref_pdb, out_pdb, "A", "A")
+            self.assertTrue(info["aligned"])
+            self.assertLess(info["ca_rmsd_A"], 0.01)
+
+            ens_rows = [
+                {"Ligand": "Hexanal", "Receptor": "conf_open", "Binding_Affinity_kcal_mol": -6.0, "Catalytically_Competent": True},
+                {"Ligand": "Hexanal", "Receptor": "conf_closed", "Binding_Affinity_kcal_mol": -8.0, "Catalytically_Competent": True},
+            ]
+            summary = aggregate_ensemble_results(ens_rows, root / "ensemble.csv")
+            self.assertEqual(summary[0]["Boltzmann_Dominant_Receptor"], "conf_closed")
+            self.assertLess(float(summary[0]["Boltzmann_Weighted_Affinity_kcal_mol"]), -7.5)
+            self.assertGreater(float(summary[0]["Boltzmann_Dominant_Weight"]), 0.90)
+
+    def test_cocrystal_ligand_extraction_and_redocking_rmsd_gate(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            holo_pdb = root / "holo.pdb"
+            holo_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "A", 501, 4.5, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 3, "S", "SO4", "A", 601, 15.0, 0.0, 0.0, "S"),
+                _pdb_atom("HETATM", 4, "C1", "SUB", "A", 701, 2.5, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 5, "O1", "SUB", "A", 701, 2.5, 1.23, 0.0, "O"),
+                _pdb_atom("HETATM", 6, "C2", "SUB", "A", 701, 3.8, -0.5, 0.0, "C"),
+                _pdb_atom("HETATM", 7, "C3", "SUB", "A", 701, 5.0, 0.2, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            cocrystal_out = root / "cocrystal.pdb"
+            extracted = extract_cocrystal_ligand(holo_pdb, cocrystal_out, chain_id="A", keep_cofactors={"NAD"})
+            self.assertTrue(extracted["found"])
+            self.assertEqual(extracted["resname"], "SUB")
+            self.assertEqual(extracted["heavy_atom_count"], 4)
+
+            docked_good = root / "docked_good.pdb"
+            docked_good.write_text("\n".join([
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 2.6, 0.1, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "O1", "LIG", "L", 999, 2.5, 1.30, 0.0, "O"),
+                _pdb_atom("HETATM", 9002, "C2", "LIG", "L", 999, 3.9, -0.4, 0.0, "C"),
+                _pdb_atom("HETATM", 9003, "C3", "LIG", "L", 999, 5.1, 0.2, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            gate_res = evaluate_redocking_control(cocrystal_out, docked_good, rmsd_threshold_A=2.0)
+            self.assertTrue(gate_res["evaluated"])
+            self.assertTrue(gate_res["passed_redocking_gate"])
+            self.assertLess(gate_res["symmetry_corrected_rmsd_A"], 0.25)
+
+    def test_dual_state_water_bridge_vs_displaced_water_scoring(self):
+        from src.common import atom_dict
+        receptor_atoms = [
+            atom_dict(_pdb_atom("ATOM", 1, "ND2", "ASN", "A", 169, 0.0, 2.85, 0.0, "N")),
+            # Water 1 at (0, 0, 0): forms tetrahedral bridge between ligand O at (2.8, 0, 0) and ASN ND2 at (0, 2.85, 0) (angle = 90 deg)
+            atom_dict(_pdb_atom("HETATM", 2, "O", "HOH", "A", 801, 0.0, 0.0, 0.0, "O")),
+            # Water 2 at (6.0, 0.0, 0.0): overlapped/displaced by ligand C2 at (5.9, 0.1, 0.0) (d = 0.14 A < 2.2 A)
+            atom_dict(_pdb_atom("HETATM", 3, "O", "HOH", "A", 802, 6.0, 0.0, 0.0, "O")),
+        ]
+        lig_model = [
+            atom_dict(_pdb_atom("HETATM", 10, "OA", "LIG", "L", 999, 2.80, 0.0, 0.0, "O")),
+            atom_dict(_pdb_atom("HETATM", 11, "C1", "LIG", "L", 999, 4.20, 0.0, 0.0, "C")),
+            atom_dict(_pdb_atom("HETATM", 12, "C2", "LIG", "L", 999, 5.90, 0.1, 0.0, "C")),
+        ]
+        rescore = compute_physicochemical_rescore(lig_model, receptor_atoms)
+        self.assertEqual(rescore["Bridged_Waters_Count"], 1)
+        self.assertEqual(rescore["Displaced_Waters_Count"], 1)
+        self.assertLess(rescore["Water_Bridge_kcal"], -0.4)
+        self.assertAlmostEqual(rescore["Water_Displacement_kcal"], -0.45, places=2)
+        # Ensure displaced water did NOT trigger a positive steric clash penalty
+        self.assertLess(rescore["PhysChem_Score_kcal_mol"], -0.5)
+
+
+    def test_pdbqt_spanning_tree_compiler_emits_nested_branch_and_torsdof(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            parsed = parse_smiles_tokens("CCCCCC=O")
+            coords = generate_fallback_3d_coords(parsed, seed=42)
+            out_pdbqt = write_fallback_pdbqt("Hexanal", coords, root / "hexanal.pdbqt", bonds=parsed["bonds"])
+            content = out_pdbqt.read_text(encoding="utf-8")
+            self.assertIn("BRANCH", content)
+            self.assertIn("ENDBRANCH", content)
+            self.assertIn("TORSDOF 4", content)
+            self.assertEqual(content.count("\nBRANCH "), 4)
+            self.assertEqual(content.count("\nENDBRANCH "), 4)
+
+    def test_interaction_analyzer_detects_all_polar_hbonds_salt_bridges_pi_halogen_and_nonpolar_safe(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            complex_pdb = root / "complex.pdb"
+            complex_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("ATOM", 2, "ND2", "ASN", "A", 169, 2.8, 0.0, 0.0, "N"),
+                _pdb_atom("ATOM", 3, "NZ", "LYS", "A", 192, 0.0, 5.8, 0.0, "N"),
+                _pdb_atom("ATOM", 4, "CG", "PHE", "A", 401, 0.0, 0.0, 3.7, "C"),
+                _pdb_atom("HETATM", 5, "ZN", "ZN", "A", 601, -2.1, 0.0, 0.0, "ZN"),
+                # Ligand with TWO polar oxygens O1 and O2, aromatic/aliphatic C1, and Cl1 halogen
+                _pdb_atom("HETATM", 10, "O1", "LIG", "L", 999, 0.0, 0.0, 0.0, "O"),
+                _pdb_atom("HETATM", 11, "C1", "LIG", "L", 999, 1.2, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 12, "O2", "LIG", "L", 999, 0.0, 3.0, 0.0, "O"),
+                _pdb_atom("HETATM", 13, "CL1", "LIG", "L", 999, 2.8, 3.1, 0.0, "CL"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            df = analyze_interactions(complex_pdb, root / "inter.csv", 302, target_chain="A")
+            types = set(df["Type"].tolist())
+            self.assertIn("Hydrogen_Bond", types)
+            self.assertIn("Metal_Coordination", types)
+            self.assertIn("Pi_Stacking", types)
+            self.assertIn("Halogen_Bond", types)
+            # Both O1 (near ASN169) and O2 (near LYS192) must be detected as H-bond participants
+            hb_atoms = set(df.loc[df["Type"] == "Hydrogen_Bond", "Ligand_Atom"].tolist())
+            self.assertIn("O1", hb_atoms)
+            self.assertIn("O2", hb_atoms)
+
+            # Purely nonpolar hydrocarbon ligand must not crash with ValueError
+            nonpolar_pdb = root / "nonpolar.pdb"
+            nonpolar_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "CB", "LEU", "A", 120, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 10, "C1", "LIG", "L", 999, 3.6, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 11, "C2", "LIG", "L", 999, 4.9, 0.0, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            df_np = analyze_interactions(nonpolar_pdb, root / "np.csv", 302, target_chain="A")
+            self.assertIn("Hydrophobic_Contact", set(df_np["Type"].tolist()))
+
+    def test_qmmm_input_adds_hydrogen_link_atom_caps_and_validates_spin_parity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            comp = root / "comp.pdb"
+            comp.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "N", "CYS", "A", 302, -1.2, 1.0, 0.0, "N"),
+                _pdb_atom("ATOM", 2, "CA", "CYS", "A", 302, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 3, "CB", "CYS", "A", 302, 1.53, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 4, "SG", "CYS", "A", 302, 2.50, 1.50, 0.0, "S"),
+                _pdb_atom("HETATM", 10, "C1", "LIG", "L", 999, 4.5, 1.5, 0.0, "C"),
+                _pdb_atom("HETATM", 11, "O1", "LIG", "L", 999, 5.7, 1.5, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            inp = write_qmmm_input(comp, root / "qmmm", {"charge": 0, "multiplicity": 1, "qm_residues": ["CYS302"]})
+            manifest = json.loads((root / "qmmm" / "comp_qmmm_manifest.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(manifest["h_link_cap_count"], 1)
+            self.assertTrue(manifest["spin_parity_validated"])
+            self.assertIn("H   ", inp.read_text(encoding="utf-8"))
+
+    def test_evaluation_computes_bedroc_deltag_rmse_and_multi_scorer_benchmark(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sum_csv = root / "summary.csv"
+            exp_csv = root / "exp.csv"
+            sum_csv.write_text(
+                "Ligand,Binding_Affinity_kcal_mol,PhysChem_Score_kcal_mol,Catalytic_Geometry_Score,Universal_Consensus_Rank,Catalytically_Competent\n"
+                "L1,-8.5,-4.2,9.1,1.0,True\n"
+                "L2,-7.8,-3.5,8.0,2.0,True\n"
+                "L3,-5.2,-1.0,2.1,3.0,False\n"
+                "L4,-4.8,-0.5,1.2,4.0,False\n",
+                encoding="utf-8",
+            )
+            exp_csv.write_text(
+                "Ligand,Experimental_Value\nL1,1\nL2,1\nL3,0\nL4,0\n",
+                encoding="utf-8",
+            )
+            metrics = evaluate_experimental_data(sum_csv, exp_csv, root / "eval_out.csv")
+            self.assertEqual(metrics["bedroc_alpha20"], 1.0)
+            self.assertIn("catalytic_geometry", metrics["by_scorer"])
+            self.assertEqual(metrics["by_scorer"]["catalytic_geometry"]["roc_auc"], 1.0)
+
+            # Test continuous Ki/IC50 (in uM) -> DeltaG RMSE/MAE calculation
+            exp_ki = root / "exp_ki.csv"
+            exp_ki.write_text(
+                "Ligand,Experimental_Value,Unit\nL1,0.8,uM\nL2,2.5,uM\nL3,150.0,uM\nL4,300.0,uM\n",
+                encoding="utf-8",
+            )
+            m_ki = evaluate_experimental_data(sum_csv, exp_ki, root / "eval_ki.csv")
+            self.assertIn("dg_rmse_kcal_mol", m_ki)
+            self.assertIn("dg_mae_kcal_mol", m_ki)
+
+    def test_refined_pose_propagation_records_refinement_delta_e_and_rmsd(self):
+        import pandas as pd
+        df = pd.read_csv(Path(__file__).resolve().parents[1] / "reports" / "docking_summary.csv")
+        self.assertIn("Refinement_Delta_E_kcal", df.columns)
+        self.assertIn("Refinement_RMSD_A", df.columns)
 
 
 if __name__ == "__main__":

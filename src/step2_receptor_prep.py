@@ -77,12 +77,12 @@ class ReceptorSelect(Select):
         chain_id = residue.get_parent().id if residue.get_parent() is not None else ""
         key = (chain_id, int(residue.id[1]), atom.get_name().strip())
         if key not in self._chosen_altlocs:
-            candidates = []
             disordered_children = getattr(atom, "child_dict", None)
-            if disordered_children:
-                candidates = list(disordered_children.values())
-            else:
-                candidates = [a for a in residue if a.get_name().strip() == atom.get_name().strip()]
+            candidates = (
+                list(disordered_children.values())
+                if disordered_children
+                else [a for a in residue if a.get_name().strip() == atom.get_name().strip()]
+            )
             candidates.sort(
                 key=lambda item: (
                     -float(item.get_occupancy() if item.get_occupancy() is not None else 0.0),
@@ -628,6 +628,122 @@ def resolve_cofactor_chain(structure, target_chain_id: str, keep_cofactors: set[
     return best_chain
 
 
+CRYSTAL_BUFFER_ARTIFACTS = {
+    "GAI", "GOL", "EDO", "SO4", "PO4", "ACT", "DMS", "PEG", "MPD", "TRS", "EPE", "MES",
+    "CL", "NA", "K", "BR", "I", "LI", "CS", "RB", "CIT", "FMT", "ACE",
+}
+
+
+def superimpose_receptor_kabsch(
+    mobile_pdb: Path,
+    reference_pdb: Path,
+    output_pdb: Path,
+    mobile_chain: str = "A",
+    reference_chain: str = "A",
+) -> dict:
+    """Superimpose a mobile receptor PDB (and all bound cofactors/waters/metals) onto a reference receptor frame using Needleman-Wunsch C-alpha alignment + Kabsch SVD."""
+    parser = PDBParser(QUIET=True)
+    ref_struct = parser.get_structure("ref", str(reference_pdb))
+    mob_struct = parser.get_structure("mob", str(mobile_pdb))
+
+    ref_ch = ref_struct[0][reference_chain] if reference_chain in ref_struct[0] else next(iter(ref_struct[0]))
+    mob_ch = mob_struct[0][mobile_chain] if mobile_chain in mob_struct[0] else next(iter(mob_struct[0]))
+
+    ref_res = [r for r in ref_ch if r.id[0] == " " and "CA" in r]
+    mob_res = [r for r in mob_ch if r.id[0] == " " and "CA" in r]
+    aligned_pairs = align_ca_residues(ref_res, mob_res)
+    if len(aligned_pairs) < 3:
+        count = min(len(ref_res), len(mob_res))
+        if count < 3:
+            raise ValueError("At least 3 C-alpha atoms are required for 3D Kabsch receptor superposition.")
+        aligned_pairs = list(zip(ref_res[:count], mob_res[:count]))
+
+    fixed_ca = [r_ref["CA"] for r_ref, _ in aligned_pairs]
+    moving_ca = [r_mob["CA"] for _, r_mob in aligned_pairs]
+    sup = Superimposer()
+    sup.set_atoms(fixed_ca, moving_ca)
+    sup.apply(mob_struct)
+    rmsd = float(getattr(sup, "rms", 0.0))
+
+    output_pdb.parent.mkdir(parents=True, exist_ok=True)
+    io = PDBIO()
+    io.set_structure(mob_struct)
+    io.save(str(output_pdb))
+    return {
+        "aligned": True,
+        "reference_pdb": str(reference_pdb),
+        "mobile_pdb": str(mobile_pdb),
+        "output_pdb": str(output_pdb),
+        "aligned_ca_count": len(aligned_pairs),
+        "ca_rmsd_A": round(rmsd, 4),
+    }
+
+
+def extract_cocrystal_ligand(
+    raw_pdb: Path,
+    output_pdb: Path,
+    chain_id: str = "A",
+    keep_cofactors: set[str] | None = None,
+    catalytic_coord: np.ndarray | None = None,
+    min_heavy_atoms: int = 4,
+) -> dict:
+    """Detect and extract any bound organic co-crystal substrate/inhibitor prior to receptor cleaning for automated redocking RMSD validation."""
+    excluded = set(COFACTORS) | set(CATALYTIC_METALS) | set(CRYSTAL_BUFFER_ARTIFACTS) | {"HOH", "WAT", "TIP", "SOL"}
+    if keep_cofactors:
+        excluded |= set(keep_cofactors)
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("cocrystal_scan", str(raw_pdb))
+    candidates = []
+
+    for model in structure:
+        for ch in model:
+            for r in ch:
+                if r.id[0] == " ":
+                    continue
+                rname = r.get_resname().strip()
+                if rname in excluded:
+                    continue
+                heavy_atoms = [
+                    a for a in r
+                    if (getattr(a, "element", "") or a.get_name()[:1]).strip().upper() != "H"
+                ]
+                if len(heavy_atoms) < min_heavy_atoms:
+                    continue
+                coords = np.array([a.get_coord() for a in heavy_atoms], dtype=float)
+                center = np.mean(coords, axis=0)
+                dist_cat = distance(center, catalytic_coord) if catalytic_coord is not None else 0.0
+                chain_bonus = 0 if ch.id == chain_id else 1
+                candidates.append((dist_cat if catalytic_coord is not None else -len(heavy_atoms), chain_bonus, -len(heavy_atoms), ch.id, int(r.id[1]), rname, heavy_atoms))
+
+    if not candidates:
+        return {"found": False, "raw_pdb": str(raw_pdb)}
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    dist_val, _, _, c_id, resseq, rname, heavy_atoms = candidates[0]
+
+    output_pdb.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for idx, a in enumerate(heavy_atoms, start=9000):
+        elem = (getattr(a, "element", "") or a.get_name()[:1]).strip().upper()[:2]
+        x, y, z = [float(v) for v in a.get_coord()]
+        aname = a.get_name().strip()[:4]
+        lines.append(f"HETATM{idx:5d} {aname:>4s} LIG L{999:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00          {elem:>2s}")
+    lines.append("END")
+    output_pdb.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return {
+        "found": True,
+        "raw_pdb": str(raw_pdb),
+        "cocrystal_pdb": str(output_pdb),
+        "resname": rname,
+        "chain": c_id,
+        "resseq": resseq,
+        "heavy_atom_count": len(heavy_atoms),
+        "distance_to_catalytic_A": round(float(dist_val), 3) if catalytic_coord is not None else None,
+    }
+
+
 def prepare_receptor(
     input_pdb: Path,
     output_dir: Path,
@@ -691,6 +807,15 @@ def prepare_receptor(
     if auto_retain_bridging_waters:
         bridging = detect_bridging_waters(structure, chain_id, keep_cofactors, cat_coord, max_waters=3)
         water_set.update(int(item["resseq"]) for item in bridging)
+
+    cocrystal_info = extract_cocrystal_ligand(
+        input_pdb,
+        output_dir / "cocrystal_ligand.pdb",
+        chain_id=chain_id,
+        keep_cofactors=keep_cofactors,
+        catalytic_coord=cat_coord,
+    )
+    (output_dir / "cocrystal_ligand_manifest.json").write_text(json.dumps(cocrystal_info, indent=2), encoding="utf-8")
 
     io = PDBIO()
     io.set_structure(structure)

@@ -103,10 +103,11 @@ def aggregate_multi_box_results(box_rows: list[dict], output_csv: Path) -> list[
     return box_rows
 
 
-def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path) -> list[dict]:
-    """Aggregate receptor ensemble runs using per-receptor rank and catalytic competence fraction."""
+def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path, temperature_k: float = 298.15) -> list[dict]:
+    """Aggregate receptor ensemble runs using per-receptor rank, catalytic competence fraction, and statistical-mechanical Boltzmann-weighted free energy."""
     if not ensemble_rows:
         return []
+    rt_kcal = 0.001987204 * float(temperature_k)
     by_receptor: dict[str, list[dict]] = {}
     for row in ensemble_rows:
         by_receptor.setdefault(str(row.get("Receptor", "primary")), []).append(row)
@@ -129,13 +130,35 @@ def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path) -> l
     for ligand, group in by_ligand.items():
         ranks = [int(r.get("Per_Receptor_Rank", 1)) for r in group]
         competent_cnt = sum(1 for r in group if str(r.get("Catalytically_Competent")) == "True")
-        affinities = [float(r["Binding_Affinity_kcal_mol"]) for r in group if r.get("Binding_Affinity_kcal_mol") not in ("", None)]
+        rec_aff_pairs = [
+            (str(r.get("Receptor", "primary")), float(r["Binding_Affinity_kcal_mol"]))
+            for r in group
+            if r.get("Binding_Affinity_kcal_mol") not in ("", None)
+        ]
+        affinities = [val for _, val in rec_aff_pairs]
+        boltzmann_dg = ""
+        dominant_rec = ""
+        dominant_weight = ""
+        if affinities:
+            e_min = min(affinities)
+            unnorm_weights = [math.exp(-(e_val - e_min) / rt_kcal) for e_val in affinities]
+            z_sum = sum(unnorm_weights)
+            weights = [w / z_sum for w in unnorm_weights]
+            # Ensemble average free energy: <Delta G>_Boltzmann = sum_i p_i * Delta G_i, and conformational free energy -RT ln((1/N) sum exp(-Delta G_i / RT))
+            boltzmann_dg = round(e_min - rt_kcal * math.log(z_sum / len(affinities)), 4)
+            best_idx = int(np.argmax(weights))
+            dominant_rec = rec_aff_pairs[best_idx][0]
+            dominant_weight = round(float(weights[best_idx]), 4)
+
         summary.append({
             "Ligand": ligand,
             "Receptor_Count": len(group),
             "Mean_Per_Receptor_Rank": round(mean(ranks), 3) if ranks else "",
             "Ensemble_Competent_Count": competent_cnt,
             "Ensemble_Competence_Fraction": round(competent_cnt / len(group), 4),
+            "Boltzmann_Weighted_Affinity_kcal_mol": boltzmann_dg,
+            "Boltzmann_Dominant_Receptor": dominant_rec,
+            "Boltzmann_Dominant_Weight": dominant_weight,
             "Min_Affinity_kcal_mol": round(min(affinities), 3) if affinities else "",
             "Max_Affinity_kcal_mol": round(max(affinities), 3) if affinities else "",
         })

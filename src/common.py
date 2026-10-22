@@ -931,10 +931,27 @@ def parse_smiles_tokens(smiles: str) -> dict:
             assigned_chiral.append(a["index"])
         elif a["symbol"] == "C" and not a["aromatic"]:
             neighbors = adj[a["index"]]
-            if len(neighbors) >= 3 and ring_count >= 2:
-                neighbor_syms = sorted(atoms[nb]["symbol"] + str(nb) for nb, _ in neighbors)
-                if len(set(neighbor_syms)) == len(neighbor_syms) and any(atoms[nb]["symbol"] == "O" for nb, _ in neighbors):
+            if all(order == 1 for _, order in neighbors) and (
+                (len(neighbors) == 3 and a["implicit_h"] == 1)
+                or (len(neighbors) == 4 and a["implicit_h"] == 0)
+            ):
+                branch_sigs = []
+                for nb, _ in neighbors:
+                    nb_atom = atoms[nb]
+                    second_shell = tuple(
+                        sorted(
+                            (atoms[n2]["symbol"], int(o2), int(atoms[n2]["implicit_h"]))
+                            for n2, o2 in adj[nb]
+                            if n2 != a["index"]
+                        )
+                    )
+                    branch_sigs.append((nb_atom["symbol"], int(nb_atom["implicit_h"]), int(nb_atom["charge"]), second_shell))
+                if len(set(branch_sigs)) == len(branch_sigs):
                     unassigned_chiral.append(a["index"])
+                elif len(neighbors) >= 3 and ring_count >= 2:
+                    neighbor_syms = sorted(atoms[nb]["symbol"] + str(nb) for nb, _ in neighbors)
+                    if len(set(neighbor_syms)) == len(neighbor_syms) and any(atoms[nb]["symbol"] == "O" for nb, _ in neighbors):
+                        unassigned_chiral.append(a["index"])
 
     rotatable_bonds = 0
     for u, v, order, is_ring in bonds:
@@ -1126,6 +1143,117 @@ def enumerate_ph_protonation_states(smiles: str, ph: float = 7.4, max_states: in
     return states[:max_states]
 
 
+def enumerate_stereoisomers_and_tautomers(smiles: str, max_isomers: int = 8) -> list[dict]:
+    """Enumerate unassigned R/S tetrahedral stereocenters, E/Z alkenes, and prototropic tautomers (keto-enol, imidazole, amide-imidic)."""
+    desalted = standardize_and_desalt_smiles(smiles)["desalted_smiles"]
+    results: list[dict] = [{
+        "label": "parent_isomer",
+        "smiles": desalted,
+        "category": "parent",
+        "rule": "input_or_desalted_parent",
+    }]
+    seen = {desalted}
+
+    # 1. Tautomer enumeration (RDKit + deterministic chemical tautomer transforms)
+    if HAS_RDKIT:
+        try:
+            from rdkit import Chem
+            from rdkit.Chem.MolStandardize import rdMolStandardize
+
+            mol = Chem.MolFromSmiles(desalted)
+            if mol is not None:
+                enumerator = rdMolStandardize.TautomerEnumerator()
+                for idx, taut in enumerate(enumerator.Enumerate(mol), 1):
+                    cand = Chem.MolToSmiles(taut, isomericSmiles=True, canonical=True)
+                    if cand not in seen and len(results) < max_isomers:
+                        seen.add(cand)
+                        results.append({
+                            "label": f"tautomer_{idx}",
+                            "smiles": cand,
+                            "category": "tautomer",
+                            "rule": "rdkit_tautomer_enumerator",
+                        })
+        except Exception:
+            pass
+
+    tautomer_rules = [
+        ("keto_enol_tautomer", r"CC=O$", "C=CO"),
+        ("keto_enol_internal", r"CC\(=O\)C", "C=C(O)C"),
+        ("imidazole_1H_3H_tautomer", r"c1c\[nH\]cn1", "c1cnc[nH]1"),
+        ("imidazole_3H_1H_tautomer", r"c1cnc\[nH\]1", "c1c[nH]cn1"),
+        ("amide_imidic_tautomer", r"C\(=O\)N([A-Za-z0-9(\[\]]*)", r"C(O)=N"),
+        ("thioamide_imidothiol_tautomer", r"C\(=S\)N", "C(S)=N"),
+    ]
+    for rule_name, pattern, replacement in tautomer_rules:
+        if re.search(pattern, desalted):
+            cand = re.sub(pattern, replacement, desalted, count=1)
+            if cand not in seen and len(results) < max_isomers:
+                try:
+                    parse_smiles_tokens(cand)
+                    seen.add(cand)
+                    results.append({
+                        "label": rule_name,
+                        "smiles": cand,
+                        "category": "tautomer",
+                        "rule": rule_name,
+                    })
+                except ValueError:
+                    pass
+
+    # 2. Unassigned R/S chiral center & E/Z double-bond stereoisomer enumeration
+    if HAS_RDKIT:
+        try:
+            from rdkit import Chem
+            from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
+
+            mol = Chem.MolFromSmiles(desalted)
+            if mol is not None:
+                opts = StereoEnumerationOptions(onlyUnassigned=True, maxIsomers=max_isomers, unique=True)
+                for idx, iso in enumerate(EnumerateStereoisomers(mol, options=opts), 1):
+                    cand = Chem.MolToSmiles(iso, isomericSmiles=True, canonical=True)
+                    if cand not in seen and len(results) < max_isomers:
+                        seen.add(cand)
+                        results.append({
+                            "label": f"stereoisomer_{idx}",
+                            "smiles": cand,
+                            "category": "stereoisomer",
+                            "rule": "rdkit_unassigned_stereoisomer",
+                        })
+        except Exception:
+            pass
+
+    try:
+        parsed = parse_smiles_tokens(desalted)
+    except ValueError:
+        return results[:max_isomers]
+
+    if parsed["unassigned_chiral"]:
+        # Locate unassigned tetrahedral carbon branch sites like C(X) and expand into [C@H](X) / [C@@H](X) or [C@](X) / [C@@](X)
+        m = re.search(r"(?<!\[)C(\([^()]+\))", desalted)
+        if m:
+            prefix = desalted[:m.start()]
+            branch_and_rest = desalted[m.start() + 1:]
+            chiral_idx = parsed["unassigned_chiral"][0]
+            imp_h = parsed["atoms"][chiral_idx].get("implicit_h", 1)
+            h_tok = "H" if imp_h >= 1 else ""
+            for tag, stereo_lbl in (("@", "stereoisomer_R_or_at"), ("@@", "stereoisomer_S_or_atat")):
+                cand = f"{prefix}[C{tag}{h_tok}]{branch_and_rest}"
+                if cand not in seen and len(results) < max_isomers:
+                    try:
+                        parse_smiles_tokens(cand)
+                        seen.add(cand)
+                        results.append({
+                            "label": stereo_lbl,
+                            "smiles": cand,
+                            "category": "stereoisomer",
+                            "rule": "tetrahedral_chiral_expansion",
+                        })
+                    except ValueError:
+                        pass
+
+    return results[:max_isomers]
+
+
 def generate_fallback_3d_coords(parsed: dict, seed: int = 0xA1D0, conformer_index: int = 0) -> list[dict]:
     """Generate realistic 3D atomic coordinates with Gasteiger-Marsili PEOE partial charges when RDKit is unavailable."""
     rng = np.random.default_rng(seed + conformer_index * 101)
@@ -1159,12 +1287,14 @@ def generate_fallback_3d_coords(parsed: dict, seed: int = 0xA1D0, conformer_inde
                 else:
                     bond_len = 1.52 if {u_sym, v_sym} == {"C"} else 1.43
 
-                torsion = (step_counter * 1.0472) + (branch_idx * 2.0944) + (conformer_index * 0.55)
+                chiral_tag = atoms[u].get("chiral", "")
+                chiral_sign = -1.0 if chiral_tag == "@@" else 1.0
+                torsion = (step_counter * 1.0472) + (branch_idx * 2.0944 * chiral_sign) + (conformer_index * 0.65)
                 tilt = 0.615 if order == 1 else 0.523
                 direction = np.array([
                     math.cos(tilt),
                     math.sin(tilt) * math.cos(torsion),
-                    math.sin(tilt) * math.sin(torsion),
+                    chiral_sign * math.sin(tilt) * math.sin(torsion),
                 ], dtype=float)
                 direction /= np.linalg.norm(direction)
                 coords[v] = u_pos + direction * bond_len
@@ -1214,21 +1344,165 @@ def write_fallback_sdf(name: str, atom_records: list[dict], bonds: list[tuple[in
     return sdf_path
 
 
-def write_fallback_pdbqt(name: str, atom_records: list[dict], pdbqt_path: Path) -> Path:
+def _format_pdbqt_hetatm(rec: dict, serial_num: int) -> str:
+    x, y, z = rec["coord"]
+    return (
+        f"HETATM{serial_num:5d} {rec['name']:>4s} UNL     1    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00    {rec['charge']:+6.3f} {rec['ad_type']:<2s}"
+    )
+
+
+def write_fallback_pdbqt(
+    name: str,
+    atom_records: list[dict],
+    pdbqt_path: Path,
+    bonds: list[tuple[int, int, int, bool]] | None = None,
+) -> Path:
+    """Compile a valid AutoDock Vina PDBQT with a spanning-tree ROOT + nested BRANCH/ENDBRANCH torsion tree and accurate TORSDOF count."""
     pdbqt_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"REMARK  Name = {name}",
-        "ROOT",
-    ]
-    for rec in atom_records:
-        x, y, z = rec["coord"]
-        lines.append(
-            f"HETATM{rec['serial']:5d} {rec['name']:>4s} UNL     1    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00    {rec['charge']:+6.3f} {rec['ad_type']:<2s}"
-        )
-    lines.extend([
-        "ENDROOT",
-        "TORSDOF 0",
-    ])
+    n = len(atom_records)
+    if n == 0:
+        pdbqt_path.write_text(f"REMARK  Name = {name}\nROOT\nENDROOT\nTORSDOF 0\n", encoding="utf-8")
+        return pdbqt_path
+
+    if bonds is None:
+        inferred: list[tuple[int, int, int, bool]] = []
+        adj_tmp: dict[int, list[int]] = {i: [] for i in range(n)}
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = distance(np.array(atom_records[i]["coord"], dtype=float), np.array(atom_records[j]["coord"], dtype=float))
+                if 0.85 <= d <= 1.88:
+                    order = 2 if d < 1.38 else 1
+                    inferred.append((i, j, order, False))
+                    adj_tmp[i].append(j)
+                    adj_tmp[j].append(i)
+        bonds = []
+        for u, v, order, _ in inferred:
+            visited = {u}
+            queue = [u]
+            in_ring = False
+            while queue:
+                curr = queue.pop(0)
+                if curr == v:
+                    in_ring = True
+                    break
+                for nb in adj_tmp[curr]:
+                    if (curr == u and nb == v) or (curr == v and nb == u):
+                        continue
+                    if nb not in visited:
+                        visited.add(nb)
+                        queue.append(nb)
+            bonds.append((u, v, order, in_ring))
+
+    adj: dict[int, list[tuple[int, int, bool]]] = {i: [] for i in range(n)}
+    for u, v, order, is_ring in bonds:
+        if 0 <= u < n and 0 <= v < n:
+            adj[u].append((v, order, is_ring))
+            adj[v].append((u, order, is_ring))
+
+    rotatable_edges: set[tuple[int, int]] = set()
+    for u, v, order, is_ring in bonds:
+        if is_ring or order != 1 or not (0 <= u < n and 0 <= v < n):
+            continue
+        if atom_records[u]["symbol"].upper() == "H" or atom_records[v]["symbol"].upper() == "H":
+            continue
+        deg_u = sum(1 for nb, _, _ in adj[u] if atom_records[nb]["symbol"].upper() != "H")
+        deg_v = sum(1 for nb, _, _ in adj[v] if atom_records[nb]["symbol"].upper() != "H")
+        if deg_u > 1 and deg_v > 1:
+            vis = {u}
+            q = [u]
+            while q:
+                cur = q.pop(0)
+                for nb, _, _ in adj[cur]:
+                    if (cur == u and nb == v) or (cur == v and nb == u):
+                        continue
+                    if nb not in vis:
+                        vis.add(nb)
+                        q.append(nb)
+            if v not in vis:
+                rotatable_edges.add((min(u, v), max(u, v)))
+
+    frag_id_of: dict[int, int] = {}
+    fragments: list[list[int]] = []
+    for i in range(n):
+        if i in frag_id_of:
+            continue
+        fid = len(fragments)
+        comp = []
+        q = [i]
+        frag_id_of[i] = fid
+        while q:
+            cur = q.pop(0)
+            comp.append(cur)
+            for nb, _, _ in adj[cur]:
+                if (min(cur, nb), max(cur, nb)) in rotatable_edges:
+                    continue
+                if nb not in frag_id_of:
+                    frag_id_of[nb] = fid
+                    q.append(nb)
+        fragments.append(comp)
+
+    root_fid = max(range(len(fragments)), key=lambda fid: (len(fragments[fid]), -min(fragments[fid])))
+
+    frag_adj: dict[int, list[tuple[int, int, int]]] = {fid: [] for fid in range(len(fragments))}
+    for u, v in sorted(rotatable_edges):
+        fu, fv = frag_id_of[u], frag_id_of[v]
+        if fu != fv:
+            frag_adj[fu].append((fv, u, v))
+            frag_adj[fv].append((fu, v, u))
+
+    serial_map: dict[int, int] = {}
+    next_serial = 1
+
+    def _assign_serials(fid: int, parent_fid: int | None, entry_atom: int | None) -> None:
+        nonlocal next_serial
+        atoms_in_frag = list(fragments[fid])
+        if entry_atom is not None and entry_atom in atoms_in_frag:
+            atoms_in_frag.remove(entry_atom)
+            atoms_in_frag.insert(0, entry_atom)
+        for a_idx in atoms_in_frag:
+            serial_map[a_idx] = next_serial
+            next_serial += 1
+        for child_fid, u_atom, v_atom in frag_adj[fid]:
+            if child_fid == parent_fid:
+                continue
+            _assign_serials(child_fid, fid, v_atom)
+
+    _assign_serials(root_fid, None, None)
+    for i in range(n):
+        if i not in serial_map:
+            serial_map[i] = next_serial
+            next_serial += 1
+
+    lines: list[str] = [f"REMARK  Name = {name}", "ROOT"]
+    for a_idx in fragments[root_fid]:
+        lines.append(_format_pdbqt_hetatm(atom_records[a_idx], serial_map[a_idx]))
+    for i in range(n):
+        if frag_id_of[i] != root_fid and not frag_adj[frag_id_of[i]]:
+            lines.append(_format_pdbqt_hetatm(atom_records[i], serial_map[i]))
+    lines.append("ENDROOT")
+
+    emitted_branches = 0
+
+    def _emit_branches(fid: int, parent_fid: int | None) -> None:
+        nonlocal emitted_branches
+        for child_fid, u_atom, v_atom in frag_adj[fid]:
+            if child_fid == parent_fid:
+                continue
+            emitted_branches += 1
+            su = serial_map[u_atom]
+            sv = serial_map[v_atom]
+            lines.append(f"BRANCH {su:3d} {sv:3d}")
+            atoms_in_child = list(fragments[child_fid])
+            if v_atom in atoms_in_child:
+                atoms_in_child.remove(v_atom)
+                atoms_in_child.insert(0, v_atom)
+            for a_idx in atoms_in_child:
+                lines.append(_format_pdbqt_hetatm(atom_records[a_idx], serial_map[a_idx]))
+            _emit_branches(child_fid, fid)
+            lines.append(f"ENDBRANCH {su:3d} {sv:3d}")
+
+    _emit_branches(root_fid, None)
+    lines.append(f"TORSDOF {emitted_branches}")
     pdbqt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return pdbqt_path

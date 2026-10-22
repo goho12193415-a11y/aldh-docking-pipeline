@@ -22,10 +22,11 @@ from src.step1_ligand_prep import (
     prepare_ligand,
     prepare_ligand_variants,
     prepare_polysaccharide_conformers,
+    prepare_ring_conformer_ensemble,
 )
-from src.step2_receptor_prep import prepare_flexible_receptor_pdbqt, prepare_receptor
+from src.step2_receptor_prep import prepare_flexible_receptor_pdbqt, prepare_receptor, superimpose_receptor_kabsch
 from src.step3_box_locator import discover_binding_pockets, locate_mechanism_box
-from src.step4_vina_runner import run_vina
+from src.step4_vina_runner import run_vina, run_vina_ensemble
 from src.step5_mechanism_scorer import score_docking
 from src.step6_interaction_viz import analyze_interactions, generate_pymol_script
 from src.step7_advanced import (
@@ -41,6 +42,7 @@ from src.step7_advanced import (
     build_execution_plan,
     detect_catalytic_cys,
     enforce_capability_gate,
+    evaluate_redocking_control,
     run_optional_plip,
     write_chemical_state_report,
     write_conformer_summary,
@@ -464,6 +466,14 @@ def run(
             LOGGER.warning("Polysaccharide results remain per-conformer; do not interpret the best Vina score as a binding free energy.")
 
         active_ligand_pdbqt = pdbqt
+        ring_conformers: list[Path] = []
+        if advanced.get("ring_ensemble", {}).get("enabled") and int(ligand_assessment.get("ring_count", 0)) >= 1 and ligand.get("smiles"):
+            ring_conformers, _ = prepare_ring_conformer_ensemble(
+                ligand["name"],
+                ligand["smiles"],
+                root / "data" / "04_prepped_ligands" / "ring_ensembles",
+                num_conformers=int(advanced.get("ring_ensemble", {}).get("conformer_count", 4)),
+            )
         if variant_paths and advanced.get("ligand_variants", {}).get("dock_variants", False) and len(variant_paths) > 1:
             best_var_summary = None
             best_var_pdbqt = pdbqt
@@ -517,7 +527,7 @@ def run(
         for replicate in range(max(1, replicate_count)):
             seed = seeds[replicate % len(seeds)] if seeds else None
             run_name = ligand["name"] if replicate_count == 1 else f'{ligand["name"]}__rep{replicate + 1}'
-            rep_output, _ = run_vina(
+            rep_output, _ = (run_vina_ensemble(config["vina"]["executable"], rigid_receptor_pdbqt, ring_conformers, selected_box, root / "data" / "05_docking_outputs", run_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"], config["vina"]["energy_range"], seed, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt) if len(ring_conformers) > 1 else run_vina(
                 config["vina"]["executable"],
                 rigid_receptor_pdbqt,
                 active_ligand_pdbqt,
@@ -530,7 +540,7 @@ def run(
                 seed,
                 use_cache=use_cache,
                 flex_pdbqt=flex_receptor_pdbqt,
-            )
+            ))
             if replicate_count > 1:
                 replicate_summary = score_docking(
                     rep_output,
@@ -562,11 +572,24 @@ def run(
             summary["Receptor"] = receptor_input.stem
             ensemble_rows.append(dict(summary))
 
-        refine_active_pose_in_pocket(
+        refined_pose_path = root / "reports" / "active_poses" / f"{ligand['name']}_refined.pdb"
+        refinement_info = refine_active_pose_in_pocket(
             Path(summary["active_pose"]),
-            root / "reports" / "active_poses" / f"{ligand['name']}_refined.pdb",
+            refined_pose_path,
             catalytic_resseq=cat_num,
         )
+        # If in-pocket L-BFGS-B rigid+torsion refinement improved pocket energy, propagate refined coordinates into active_pose for all downstream analyses
+        if refinement_info.get("refined") and float(refinement_info.get("energy_improvement_kcal", 0.0)) > 0.0 and refined_pose_path.is_file():
+            shutil.copyfile(refined_pose_path, Path(summary["active_pose"]))
+
+        with _SUMMARY_LOCK:
+            summary_csv_path = root / "reports" / "docking_summary.csv"
+            if summary_csv_path.is_file():
+                df_sum = pd.read_csv(summary_csv_path)
+                mask = df_sum["Ligand"].astype(str) == ligand["name"]
+                df_sum.loc[mask, "Refinement_Delta_E_kcal"] = round(float(refinement_info.get("energy_improvement_kcal", 0.0)), 3)
+                df_sum.loc[mask, "Refinement_RMSD_A"] = round(float(refinement_info.get("refinement_rmsd_A", 0.0)), 4)
+                df_sum.to_csv(summary_csv_path, index=False)
 
         interactions = analyze_interactions(
             Path(summary["active_pose"]),
@@ -628,6 +651,14 @@ def run(
                 enzyme_cfg.get("conserved_waters", []),
                 cat_num,
             )
+            kabsch_info = superimpose_receptor_kabsch(
+                ens_cleaned,
+                cleaned,
+                ens_cleaned,
+                mobile_chain=config["receptor"]["chain_id"],
+                reference_chain=config["receptor"]["chain_id"],
+            )
+            LOGGER.info("Superimposed ensemble receptor %s onto primary frame (CA RMSD=%.3f A)", ens_stem, kabsch_info["ca_rmsd_A"])
             ens_box = locate_mechanism_box(ens_cleaned, config)
             for ligand in config["ligands"]:
                 lig_pdbqt = root / "data" / "04_prepped_ligands" / f"{ligand['name']}.pdbqt"
@@ -657,6 +688,21 @@ def run(
         if len(ensemble_rows) > len(config["ligands"]):
             aggregate_ensemble_results(ensemble_rows, root / "reports" / "ensemble_consensus.csv")
 
+    cocrystal_pdb = receptor_out / "cocrystal_ligand.pdb"
+    if not skip_vina and cocrystal_pdb.is_file():
+        for ligand in config["ligands"]:
+            pose_pdb = root / "reports" / "active_poses" / f"{ligand['name']}_active.pdb"
+            if pose_pdb.is_file():
+                redock_res = evaluate_redocking_control(
+                    cocrystal_pdb,
+                    pose_pdb,
+                    rmsd_threshold_A=float(advanced.get("redocking_rmsd_threshold_A", 2.0)),
+                    output_json=root / "reports" / "redocking_validation.json",
+                )
+                if redock_res.get("evaluated"):
+                    LOGGER.info("Co-crystal redocking control for %s: RMSD=%.3f A (%s)", ligand["name"], redock_res["symmetry_corrected_rmsd_A"], redock_res["status"])
+                    break
+
     if not skip_vina and advanced.get("evaluation", {}).get("enabled"):
         exp_csv = resolve_path(root, advanced["evaluation"].get("experimental_csv", "data/experimental_activity.csv"))
         if exp_csv.is_file() and (root / "reports" / "docking_summary.csv").is_file():
@@ -669,7 +715,7 @@ def run(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Universal Mechanism-Guided AutoDock Vina Pipeline v4.0")
+    parser = argparse.ArgumentParser(description="Universal Mechanism-Guided AutoDock Vina Pipeline v6.0")
     parser.add_argument("--config", type=Path, default=Path("config/pipeline_config.yaml"))
     parser.add_argument("--skip-vina", action="store_true", help="Prepare ligands/receptor only")
     parser.add_argument("--preflight", action="store_true", help="Check inputs and external dependencies without running")

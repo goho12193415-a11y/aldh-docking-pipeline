@@ -25,64 +25,134 @@ def parse_complex(path: Path) -> tuple[list[dict], list[dict]]:
     return receptor, ligand
 
 
+AROMATIC_RES = {"PHE", "TYR", "TRP", "HIS"}
+CHARGED_REC_ATOMS = {
+    ("ASP", "OD1"), ("ASP", "OD2"), ("GLU", "OE1"), ("GLU", "OE2"),
+    ("LYS", "NZ"), ("ARG", "NH1"), ("ARG", "NH2"), ("ARG", "NE"),
+    ("HIS", "ND1"), ("HIS", "NE2"),
+}
+METAL_RES = {"ZN", "MG", "FE", "MN", "CA", "CU", "NI", "CO"}
+COFACTOR_RES = {"NAD", "NAP", "NDP", "FAD", "FMN", "HEM", "HEC", "HEA"}
+
+
 def analyze_interactions(
     complex_pdb: Path,
     output_csv: Path,
     cys_res_num: int,
     target_chain: str | None = None,
 ) -> pd.DataFrame:
+    """Comprehensive 3D protein-ligand interaction profiler across all ligand polar, charged, aromatic, halogen, and aliphatic atoms."""
     receptor, ligand = parse_complex(complex_pdb)
-    lig_o = next((a for a in ligand if a["element"].upper() in {"O", "N", "S"}), None)
-    lig_c = [a for a in ligand if a["element"].upper() == "C"]
-    if lig_o is None or not lig_c:
-        raise ValueError(f"Could not identify ligand carbonyl atoms in {complex_pdb}")
-    carbonyl_c = min(lig_c, key=lambda a: distance(a["coord"], lig_o["coord"]))
-    aliphatic = [a for a in lig_c if a["serial"] != carbonyl_c["serial"]] or [carbonyl_c]
-    rows = []
+    if not ligand:
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        empty = pd.DataFrame([], columns=INTERACTION_COLUMNS)
+        empty.to_csv(output_csv, index=False)
+        return empty
+
+    lig_heavy = [a for a in ligand if a["element"].upper() != "H" and a["name"] != "HD"] or ligand
+    lig_polar = [a for a in lig_heavy if a["element"].upper() in {"O", "N", "S"} or a["name"] in {"OA", "NA", "SA"}]
+    lig_c = [a for a in lig_heavy if a["element"].upper() == "C" or a["name"] == "A"]
+    lig_halogens = [a for a in lig_heavy if a["element"].upper() in {"F", "CL", "BR", "I"}]
+
+    if lig_polar and lig_c:
+        # Pick the carbon bonded to a polar atom (e.g., carbonyl/warhead carbon)
+        pairs = [(c, p, distance(c["coord"], p["coord"])) for c in lig_c for p in lig_polar]
+        carbonyl_c = min(pairs, key=lambda item: item[2])[0]
+    elif lig_c:
+        carbonyl_c = lig_c[0]
+    else:
+        carbonyl_c = lig_heavy[0]
+
+    aliphatic = ([a for a in lig_c if a["serial"] != carbonyl_c["serial"]] if lig_polar else lig_c) or (lig_c if lig_c else lig_heavy)
+    rows: list[dict] = []
+    seen_contacts: set[tuple[str, str, str, str]] = set()
+
+    def _add_row(itype: str, lig_name: str, rec_res: str, rec_atom: str, dist_val: float) -> None:
+        key = (itype, lig_name, rec_res, rec_atom)
+        if key not in seen_contacts:
+            seen_contacts.add(key)
+            rows.append({
+                "Type": itype,
+                "Ligand_Atom": lig_name,
+                "Receptor_Res": rec_res,
+                "Receptor_Atom": rec_atom,
+                "Distance_A": round(float(dist_val), 3),
+            })
+
     for atom in receptor:
-        if target_chain and atom["chain"] != target_chain and atom["resname"] not in {"NAD", "NAP", "NDP"}:
+        if target_chain and atom["chain"] != target_chain and atom["resname"] not in (COFACTOR_RES | METAL_RES | {"HOH", "WAT"}):
             continue
-        if atom["resname"] in {"CYS", "SER"} and atom["resseq"] == cys_res_num and atom["name"] in {"SG", "OG"}:
-            rows.append({
-                "Type": "Catalytic_Attack",
-                "Ligand_Atom": carbonyl_c["name"],
-                "Receptor_Res": f"{atom['resname']}{atom['resseq']}",
-                "Receptor_Atom": atom["name"],
-                "Distance_A": round(distance(carbonyl_c["coord"], atom["coord"]), 3),
-            })
-        if atom["resname"] in {"NAD", "NAP", "NDP"} and atom["name"] in {"C4N", "C4"}:
-            rows.append({
-                "Type": "Hydride_Transfer",
-                "Ligand_Atom": carbonyl_c["name"],
-                "Receptor_Res": f"{atom['resname']}{atom['resseq']}",
-                "Receptor_Atom": atom["name"],
-                "Distance_A": round(distance(carbonyl_c["coord"], atom["coord"]), 3),
-            })
-        if atom["element"].upper() in {"N", "O", "S"} and distance(lig_o["coord"], atom["coord"]) <= 3.5:
-            rows.append({
-                "Type": "Hydrogen_Bond",
-                "Ligand_Atom": lig_o["name"],
-                "Receptor_Res": f"{atom['resname']}{atom['resseq']}",
-                "Receptor_Atom": atom["name"],
-                "Distance_A": round(distance(lig_o["coord"], atom["coord"]), 3),
-            })
-    hits = {}
+        r_res_label = f"{atom['resname']}{atom['resseq']}"
+        r_el = atom["element"].upper()
+
+        # 1. Catalytic attack (CYS, SER, THR, LYS, ASP, GLU, HIS)
+        if atom["resseq"] == cys_res_num and atom["name"] in {"SG", "OG", "OG1", "NZ", "OD1", "OE1", "NE2"}:
+            _add_row("Catalytic_Attack", carbonyl_c["name"], r_res_label, atom["name"], distance(carbonyl_c["coord"], atom["coord"]))
+
+        # 2. Hydride transfer / cofactor reactive contact (NAD C4N, FAD N5, HEM FE)
+        if atom["resname"] in COFACTOR_RES and atom["name"] in {"C4N", "C4", "N5", "C4X", "FE"}:
+            _add_row("Hydride_Transfer", carbonyl_c["name"], r_res_label, atom["name"], distance(carbonyl_c["coord"], atom["coord"]))
+
+        # 3. Metal coordination across all ligand polar atoms
+        if atom["resname"] in METAL_RES or (atom["resname"] in {"HEM", "HEC"} and atom["name"] == "FE"):
+            for lp in lig_polar:
+                d_m = distance(lp["coord"], atom["coord"])
+                if 1.65 <= d_m <= 3.20:
+                    _add_row("Metal_Coordination", lp["name"], r_res_label, atom["name"], d_m)
+
+        # 4. Hydrogen bonds across ALL ligand polar atoms (O, N, S)
+        if r_el in {"N", "O", "S"}:
+            for lp in lig_polar:
+                d_hb = distance(lp["coord"], atom["coord"])
+                if 2.20 <= d_hb <= 3.50:
+                    _add_row("Hydrogen_Bond", lp["name"], r_res_label, atom["name"], d_hb)
+
+        # 5. Salt bridges between polar/charged ligand groups and charged receptor sidechains
+        if (atom["resname"], atom["name"]) in CHARGED_REC_ATOMS:
+            for lp in lig_polar:
+                d_sb = distance(lp["coord"], atom["coord"])
+                if 2.40 <= d_sb <= 4.00 and (abs(float(lp.get("charge") or 0.0)) >= 0.25 or lp["element"].upper() in {"O", "N"}):
+                    _add_row("Salt_Bridge", lp["name"], r_res_label, atom["name"], d_sb)
+
+        # 6. Halogen bonds (C-X ... O/N/S)
+        if r_el in {"O", "N", "S"} and lig_halogens:
+            for lx in lig_halogens:
+                d_xb = distance(lx["coord"], atom["coord"])
+                if 2.70 <= d_xb <= 3.80:
+                    _add_row("Halogen_Bond", lx["name"], r_res_label, atom["name"], d_xb)
+
+    # 7. Pi-Stacking and Hydrophobic contacts (per-residue shortest distance)
+    hydro_hits: dict[tuple[str, str, int], dict] = {}
+    pi_hits: dict[tuple[str, str, int], dict] = {}
     for atom in receptor:
         if target_chain and atom["chain"] != target_chain:
             continue
-        if atom["resname"] in HYDROPHOBIC_RES and atom["element"].upper() == "C" and atom["name"] not in {"C", "CA"}:
+        rname = atom["resname"]
+        key = (atom["chain"], rname, atom["resseq"])
+        if rname in AROMATIC_RES and atom["name"] in {"CG", "CD1", "CD2", "CE1", "CE2", "CZ", "CE3", "CZ2", "CZ3"}:
+            for lc in lig_c:
+                d_pi = distance(lc["coord"], atom["coord"])
+                if 3.35 <= d_pi <= 4.30 and (key not in pi_hits or d_pi < pi_hits[key]["Distance_A"]):
+                    pi_hits[key] = {
+                        "Type": "Pi_Stacking",
+                        "Ligand_Atom": lc["name"],
+                        "Receptor_Res": f"{rname}{atom['resseq']}",
+                        "Receptor_Atom": atom["name"],
+                        "Distance_A": round(d_pi, 3),
+                    }
+        if rname in HYDROPHOBIC_RES and atom["element"].upper() == "C" and atom["name"] not in {"C", "CA"}:
             for lc in aliphatic:
                 d = distance(lc["coord"], atom["coord"])
-                key = (atom["chain"], atom["resname"], atom["resseq"])
-                if 3.3 <= d <= 4.0 and (key not in hits or d < hits[key]["Distance_A"]):
-                    hits[key] = {
+                if 3.3 <= d <= 4.0 and (key not in hydro_hits or d < hydro_hits[key]["Distance_A"]):
+                    hydro_hits[key] = {
                         "Type": "Hydrophobic_Contact",
                         "Ligand_Atom": lc["name"],
-                        "Receptor_Res": f"{atom['resname']}{atom['resseq']}",
+                        "Receptor_Res": f"{rname}{atom['resseq']}",
                         "Receptor_Atom": atom["name"],
                         "Distance_A": round(d, 3),
                     }
-    rows.extend(hits.values())
+    rows.extend(pi_hits.values())
+    rows.extend(hydro_hits.values())
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rows, columns=INTERACTION_COLUMNS)
     frame.to_csv(output_csv, index=False)

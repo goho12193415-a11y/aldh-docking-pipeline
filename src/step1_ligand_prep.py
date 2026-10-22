@@ -11,6 +11,7 @@ from .common import (
     HAS_MEEKO,
     HAS_RDKIT,
     enumerate_ph_protonation_states,
+    enumerate_stereoisomers_and_tautomers,
     generate_fallback_3d_coords,
     parse_smiles_tokens,
     standardize_and_desalt_smiles,
@@ -37,6 +38,12 @@ def enumerate_ligand_variants(
         if candidate not in seen and len(variants) < max_variants:
             seen.add(candidate)
             variants.append((state["label"], candidate))
+
+    for iso in enumerate_stereoisomers_and_tautomers(base_smiles, max_isomers=max_variants):
+        candidate = iso["smiles"]
+        if candidate not in seen and len(variants) < max_variants:
+            seen.add(candidate)
+            variants.append((iso["label"], candidate))
 
     if HAS_RDKIT:
         try:
@@ -163,7 +170,7 @@ def prepare_ligand(
     parsed = parse_smiles_tokens(resolved_smiles)
     atom_records = generate_fallback_3d_coords(parsed, seed=0xA1D0, conformer_index=0)
     write_fallback_sdf(name, atom_records, parsed["bonds"], sdf_path)
-    return write_fallback_pdbqt(name, atom_records, pdbqt_path)
+    return write_fallback_pdbqt(name, atom_records, pdbqt_path, bonds=parsed["bonds"])
 
 
 def prepare_ligand_variants(
@@ -257,7 +264,7 @@ def prepare_polysaccharide_conformers(
             pdbqt_path = output_dir / f"{conformer_name}.pdbqt"
             atom_records = generate_fallback_3d_coords(parsed, seed=0xA1D0, conformer_index=ordinal)
             write_fallback_sdf(conformer_name, atom_records, parsed["bonds"], sdf_path)
-            write_fallback_pdbqt(conformer_name, atom_records, pdbqt_path)
+            write_fallback_pdbqt(conformer_name, atom_records, pdbqt_path, bonds=parsed["bonds"])
             pdbqt_paths.append(pdbqt_path)
             manifest.append({
                 "name": conformer_name,
@@ -279,6 +286,91 @@ def prepare_polysaccharide_conformers(
                     "Not a glycosidic free-energy ensemble",
                     "Validate with carbohydrate force fields or MD before quantitative claims",
                 ],
+                "conformers": manifest,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return pdbqt_paths, manifest_path
+
+
+def prepare_ring_conformer_ensemble(
+    name: str,
+    smiles: str,
+    output_dir: Path,
+    num_conformers: int = 4,
+    rmsd_threshold: float = 0.5,
+) -> tuple[list[Path], Path]:
+    """Generate RMSD-diverse 3D ring/macrocycle conformer PDBQT files for ensemble docking in Vina."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    desalt_info = standardize_and_desalt_smiles(smiles)
+    clean_smiles = desalt_info["desalted_smiles"]
+    manifest = []
+    pdbqt_paths: list[Path] = []
+
+    if HAS_RDKIT and HAS_MEEKO:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+
+        mol = Chem.MolFromSmiles(clean_smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES for {name}: {clean_smiles}")
+        mol = Chem.AddHs(mol)
+        params = AllChem.ETKDGv3()
+        params.randomSeed = 0xA1D0
+        # Keep the requested ensemble cardinality. Diversity is assessed downstream;
+        # RDKit's pruning can otherwise collapse small rings to a single conformer.
+        params.pruneRmsThresh = -1.0
+        params.useSmallRingTorsions = True
+        if hasattr(params, "useMacrocycleTorsions"):
+            params.useMacrocycleTorsions = True
+        conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=max(1, int(num_conformers)), params=params))
+        if not conf_ids:
+            conf_ids = [AllChem.EmbedMolecule(mol, params)]
+        for ordinal, cid in enumerate(conf_ids, 1):
+            if AllChem.MMFFHasAllMoleculeParams(mol):
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid, maxIters=400)
+            conf_mol = Chem.Mol(mol)
+            conf_mol.RemoveAllConformers()
+            conf_mol.AddConformer(mol.GetConformer(cid), assignId=True)
+            conf_name = f"{name}__ringconf{ordinal:03d}"
+            sdf_path = output_dir / f"{conf_name}.sdf"
+            writer = Chem.SDWriter(str(sdf_path))
+            writer.write(conf_mol)
+            writer.close()
+            pdbqt_path = _write_pdbqt(conf_name, conf_mol, output_dir)
+            pdbqt_paths.append(pdbqt_path)
+            manifest.append({
+                "name": conf_name,
+                "conformer_id": int(cid),
+                "sdf": str(sdf_path),
+                "pdbqt": str(pdbqt_path),
+            })
+    else:
+        parsed = parse_smiles_tokens(clean_smiles)
+        for ordinal in range(1, max(1, int(num_conformers)) + 1):
+            conf_name = f"{name}__ringconf{ordinal:03d}"
+            sdf_path = output_dir / f"{conf_name}.sdf"
+            pdbqt_path = output_dir / f"{conf_name}.pdbqt"
+            atom_records = generate_fallback_3d_coords(parsed, seed=0xA1D0, conformer_index=ordinal)
+            write_fallback_sdf(conf_name, atom_records, parsed["bonds"], sdf_path)
+            write_fallback_pdbqt(conf_name, atom_records, pdbqt_path, bonds=parsed["bonds"])
+            pdbqt_paths.append(pdbqt_path)
+            manifest.append({
+                "name": conf_name,
+                "conformer_id": ordinal - 1,
+                "sdf": str(sdf_path),
+                "pdbqt": str(pdbqt_path),
+            })
+
+    manifest_path = output_dir / f"{name}__ring_ensemble.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "ligand": name,
+                "input_smiles": clean_smiles,
+                "conformer_count": len(manifest),
                 "conformers": manifest,
             },
             indent=2,

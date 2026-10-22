@@ -1,6 +1,6 @@
 # ALDH Docking Pipeline
 
-这是一个面向 Windows 的 **Universal v4.0** 机制引导型 AutoDock Vina 管道，覆盖：
+这是一个面向 Windows 的机制引导型 AutoDock Vina 管道，覆盖：
 
 1. PubChem/RDKit/Meeko 配体准备；
 2. 受体清理、辅酶保留或基于 C-alpha 对齐的 NAD 移植；
@@ -8,9 +8,6 @@
 4. 安全的 Windows Vina 调用；
 5. 全部 docking mode 的催化几何重排序；
 6. 相互作用表、标准化复合物 PDB、PyMOL 脚本和高清渲染。
-7. 9 类机制模板、3D 微环境 pKa、自动去盐/微态枚举和 PEOE 物理化学重打分；
-8. 缺失侧链/羰基氧修复、AltLoc 清理、全蛋白 3D 空腔发现、柔性受体和 L-BFGS-B 姿态精修；
-9. 多 worker 批量筛选、对称性校正 3D RMSD、共价加合物构建和交互式 Tk 3D 口袋视图。
 
 ## 环境
 
@@ -95,12 +92,6 @@ python scripts/validate_outputs.py
 输出位于 `reports/`：
 
 - `docking_summary.csv`
-- `reports/receptor_pka_audit.json`
-- `reports/evaluation_metrics.json`（启用实验评估时）
-- `reports/evaluation_results.csv`（启用实验评估时）
-- `reports/multi_box_results.csv`、`reports/ensemble_consensus.csv`（启用对应批量模式时）
-- `reports/replicates/`、`reports/variants/`、`reports/ensemble/`、`reports/multi_box/`
-- `reports/md/`、`reports/qmmm/`、`reports/covalent/`、`reports/plip/`（启用对应外部工作流时）
 - `active_poses/*_active.pdb`
 - `interactions/*_interactions.csv`
 - `figures/*_render.pml`
@@ -162,7 +153,7 @@ python scripts/validate_outputs.py
 - `reports/capability_gate.json`：是否阻止了专用体系的标准解释；
 - `reports/run_manifest.json`：配置 SHA-256、机制模板、闸门状态和运行模式。
 
-机制模板位于 `config/mechanisms/`，当前内置并通过测试的 9 个家族为：ALDH、丝氨酸水解酶、半胱氨酸蛋白酶、金属酶、细胞色素 P450、黄素酶、糖苷酶、激酶和通用结合。每个模板都有自己的几何/化学参数；体系仍会经过 capability gate，复杂配体或缺少必要辅因子时必须人工复核或使用专用方法。
+机制模板位于 `config/mechanisms/`。目前 ALDH 模板是已实现评分的安全路径；丝氨酸水解酶、半胱氨酸蛋白酶和金属酶模板目前只提供准备/审计接口，默认不会被当作 ALDH 规则运行。严格闸门会阻止这些模板进入标准 docking；只有显式 `--allow-specialized` 才能进行探索性运行。
 
 快速实验会比较每条蛋白链的辅因子、催化 Cys 和蛋白规模，并用确定性规则选择目标链；候选证据会写入 `config/quick_config.yaml` 的 `project.auto_selection`。
 
@@ -190,8 +181,6 @@ GUI 的“结果与审计摘要”会自动读取受体状态、box 审计、执
 
 如果只是进行非标准探索性尝试，必须显式运行 `python main.py --allow-specialized`。程序会生成 `reports/capability_gate.json` 并标记 `exploratory_override`；这不代表结果变得可靠。
 
-### Universal v4.0 新增能力与边界
+### 酶类对接优化边界
 
-v4 会额外执行受体修复和化学准备：重建缺失羰基氧/关键侧链原子、解析 AltLoc、识别桥联水、估计活性位点 3D 微环境 pKa、生成实验 pH 下的微态，并把这些过程记录到 `receptor_pka_audit.json`、`structure_repair_audit.json` 和 `chemical_state.json`。这些是可审计的模型化准备，不等于实验 pKa、真实质子转移路径或 QM/MM 反应能垒。
-
-`--workers N` 可以并行执行批量配体/重复筛选，`--no-cache` 可强制重跑 Vina。盲扫空腔、柔性受体、共价加合物、MD/QM/MM、PLIP 和实验校准均有实际入口，但是否能形成可靠科学结论仍取决于输入质量、外部软件和人工复核；报告中的 `Reliability_Grade`、`Capability_Status` 和 `Stability_Status` 优先于单一 Vina 分数。
+酶类任务会额外生成 `reports/enzyme_readiness.json`，检查配置的催化/酸碱/稳定残基是否存在且残基名匹配、目标链是否保留所需辅因子、结构中的结晶水数量、alternate location，以及是否声明需要辅因子。`enzyme.flexible_residues` 和 `enzyme.conserved_waters` 是后续柔性残基/保守水建模的显式配置入口；当前 readiness 报告不会假装完成质子化、金属配位、诱导契合或真实反应状态验证。

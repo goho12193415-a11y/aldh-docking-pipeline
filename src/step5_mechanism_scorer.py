@@ -142,16 +142,30 @@ def compute_physicochemical_rescore(
     receptor_atoms: list[dict],
     protonation_penalty_kcal: float = 0.0,
 ) -> dict[str, float]:
-    """Physics-informed rescorer using real PDBQT Gasteiger/PEOE partial charges when present, distance-dependent Coulomb electrostatics, directional H-bonds, metal Morse coordination, and Born-like desolvation."""
+    """Physics-informed rescorer with PDBQT/PEOE partial charges, Coulomb electrostatics, directional H-bonds, metal coordination, and dual-state water bridging vs. entropic water displacement."""
     lig_heavy = [a for a in model if a["element"].upper() != "H" and a["name"] != "HD"]
     if not lig_heavy or not receptor_atoms:
-        return {"PhysChem_Score_kcal_mol": 0.0, "Electrostatic_kcal": 0.0, "Metal_Coord_kcal": 0.0, "HBond_kcal": 0.0}
+        return {
+            "PhysChem_Score_kcal_mol": 0.0,
+            "Electrostatic_kcal": 0.0,
+            "Metal_Coord_kcal": 0.0,
+            "HBond_kcal": 0.0,
+            "Water_Bridge_kcal": 0.0,
+            "Water_Displacement_kcal": 0.0,
+            "Bridged_Waters_Count": 0,
+            "Displaced_Waters_Count": 0,
+        }
 
     lig_coords = np.array([a["coord"] for a in lig_heavy], dtype=float)
     lig_center = np.mean(lig_coords, axis=0)
-    pocket_atoms = [
+    near_atoms = [
         a for a in receptor_atoms
         if a["element"].upper() != "H" and distance(a["coord"], lig_center) <= 10.0
+    ]
+    pocket_atoms = [a for a in near_atoms if a["resname"] not in {"HOH", "WAT", "TIP", "SOL"}]
+    water_atoms = [
+        a for a in near_atoms
+        if a["resname"] in {"HOH", "WAT", "TIP", "SOL"} and a["element"].upper() == "O"
     ]
 
     vdw_kcal = 0.0
@@ -159,6 +173,13 @@ def compute_physicochemical_rescore(
     hbond_kcal = 0.0
     metal_kcal = 0.0
     hydro_kcal = 0.0
+    water_bridge_kcal = 0.0
+    water_disp_kcal = 0.0
+    bridged_waters_count = 0
+    displaced_waters_count = 0
+
+    def _norm_el(atom: dict) -> str:
+        return "O" if atom["name"] == "OA" else ("N" if atom["name"] == "NA" else ("S" if atom["name"] == "SA" else ("C" if atom["name"] == "A" else atom["element"].upper())))
 
     def _effective_charge(atom: dict, is_lig: bool) -> float:
         parsed_q = atom.get("charge")
@@ -185,7 +206,7 @@ def compute_physicochemical_rescore(
         return 0.05 if el == "C" else 0.0
 
     for la in lig_heavy:
-        l_el = "O" if la["name"] == "OA" else ("N" if la["name"] == "NA" else ("C" if la["name"] == "A" else la["element"].upper()))
+        l_el = _norm_el(la)
         q_l = _effective_charge(la, True)
         for pa in pocket_atoms:
             d = distance(la["coord"], pa["coord"])
@@ -215,12 +236,54 @@ def compute_physicochemical_rescore(
                 ratio = r_eq / max(2.4, d)
                 vdw_kcal += 0.045 * ((ratio ** 8) - 2.0 * (ratio ** 4))
 
-    total = round(vdw_kcal + elec_kcal + hbond_kcal + metal_kcal + hydro_kcal + float(protonation_penalty_kcal), 3)
+    # Dual-state explicit water thermodynamics: Displaced Water (entropic gain, clash-exempt) vs. Tetrahedral Water Bridge
+    rec_polar = [pa for pa in pocket_atoms if pa["element"].upper() in {"O", "N", "S"}]
+    lig_polar = [la for la in lig_heavy if _norm_el(la) in {"O", "N", "S"}]
+
+    for wa in water_atoms:
+        w_coord = wa["coord"]
+        min_d_lig = min(distance(la["coord"], w_coord) for la in lig_heavy)
+        if min_d_lig < 2.2:
+            # Ligand physically occupies the water site -> displaces water into bulk solvent (entropic release, no clash penalty)
+            displaced_waters_count += 1
+            water_disp_kcal = max(-1.35, water_disp_kcal - 0.45)
+        elif lig_polar and rec_polar:
+            near_lp = [(la, distance(la["coord"], w_coord)) for la in lig_polar if 2.2 <= distance(la["coord"], w_coord) <= 3.5]
+            near_rp = [(pa, distance(pa["coord"], w_coord)) for pa in rec_polar if 2.2 <= distance(pa["coord"], w_coord) <= 3.5]
+            best_bridge_e = 0.0
+            for la, d_lw in near_lp:
+                v_lw = la["coord"] - w_coord
+                n_lw = float(np.linalg.norm(v_lw))
+                if n_lw < 1e-6:
+                    continue
+                for pa, _ in near_rp:
+                    v_rw = pa["coord"] - w_coord
+                    n_rw = float(np.linalg.norm(v_rw))
+                    if n_rw < 1e-6:
+                        continue
+                    cos_ang = float(np.clip(np.dot(v_lw, v_rw) / (n_lw * n_rw), -1.0, 1.0))
+                    ang_deg = math.degrees(math.acos(cos_ang))
+                    if 80.0 <= ang_deg <= 145.0:
+                        e_br = -0.60 * math.exp(-((d_lw - 2.85) ** 2) / 0.30)
+                        if e_br < best_bridge_e:
+                            best_bridge_e = e_br
+            if best_bridge_e < 0.0:
+                bridged_waters_count += 1
+                water_bridge_kcal += best_bridge_e
+
+    total = round(
+        vdw_kcal + elec_kcal + hbond_kcal + metal_kcal + hydro_kcal + water_bridge_kcal + water_disp_kcal + float(protonation_penalty_kcal),
+        3,
+    )
     return {
         "PhysChem_Score_kcal_mol": total,
         "Electrostatic_kcal": round(elec_kcal, 3),
         "Metal_Coord_kcal": round(metal_kcal, 3),
         "HBond_kcal": round(hbond_kcal, 3),
+        "Water_Bridge_kcal": round(water_bridge_kcal, 3),
+        "Water_Displacement_kcal": round(water_disp_kcal, 3),
+        "Bridged_Waters_Count": bridged_waters_count,
+        "Displaced_Waters_Count": displaced_waters_count,
     }
 
 
