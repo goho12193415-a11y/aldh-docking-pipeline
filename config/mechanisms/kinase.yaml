@@ -1,0 +1,15 @@
+name: kinase
+display_name: 蛋白激酶（ATP/变构口袋）
+status: implemented
+description: 针对激酶催化域（催化 LYS、DFG 基序 ASP 及铰链区 Hinge 主链氢键）定位结合口袋并评估铰链区氢键与极性锚定。
+required_roles:
+  catalytic_residue:
+    residue_names: [LYS, ASP, GLU]
+    required_atoms: [NZ, OD1, OE1, CA]
+box_strategy: kinase_cleft_center
+scoring_strategy: kinase_hinge_and_dfg_geometry
+default_thresholds:
+  d_nuc_min: 2.4
+  d_nuc_max: 5.5
+interpretation_limits:
+  - DFG-in/DFG-out conformational state of the input receptor governs inhibitor class compatibility.

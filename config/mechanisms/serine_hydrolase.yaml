@@ -1,16 +1,20 @@
 name: serine_hydrolase
 display_name: 丝氨酸水解酶
-status: audit_only
-description: 为丝氨酸亲核体、酸碱残基和氧阴离子穴提供模板接口；当前仅支持准备与审计。
+status: implemented
+description: 催化丝氨酸（SER-OG）在组氨酸-天冬氨酸/谷氨酸催化三联体及氧阴离子穴协同下对酯、酰胺或羰基亲电中心发起亲核进攻。
 required_roles:
   catalytic_residue:
     residue_names: [SER]
     required_atoms: [OG]
   acid_base_residue:
     residue_names: [HIS, ASP, GLU]
-    required_atoms: [N, OD1, OE1]
+    required_atoms: [NE2, ND1, OD1, OE1]
 box_strategy: catalytic_residue_center
-scoring_strategy: template_audit_only
+scoring_strategy: serine_hydrolase_triad_geometry
+default_thresholds:
+  d_nuc_min: 2.6
+  d_nuc_max: 4.5
+  d_oxy_max: 4.2
 interpretation_limits:
-  - Standard ALDH scoring must not be used for this mechanism.
-  - Reaction-state and protonation validation are still required.
+  - Geometric competence filters pre-reactive poses and does not prove covalent acylation kinetics.
+  - Reaction-state and protonation validation are recommended before QM/MM barriers.

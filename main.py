@@ -1,46 +1,59 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import hashlib
+import importlib.util
 import json
 import logging
-import importlib.util
-import hashlib
+import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
-from src.common import configure_logging, require_executable, resolve_path
-from src.step1_ligand_prep import prepare_ligand, prepare_ligand_variants, prepare_polysaccharide_conformers
-from src.step2_receptor_prep import prepare_receptor
-from src.step3_box_locator import locate_box
+from src.common import configure_logging, estimate_receptor_microenvironment_pka, require_executable, resolve_path
+from src.mechanism_templates import load_mechanism_template, mechanism_capability
+from src.step10_evaluation import evaluate_experimental_data
+from src.step1_ligand_prep import (
+    discover_raw_ligands,
+    prepare_ligand,
+    prepare_ligand_variants,
+    prepare_polysaccharide_conformers,
+)
+from src.step2_receptor_prep import prepare_flexible_receptor_pdbqt, prepare_receptor
+from src.step3_box_locator import discover_binding_pockets, locate_mechanism_box
 from src.step4_vina_runner import run_vina
 from src.step5_mechanism_scorer import score_docking
 from src.step6_interaction_viz import analyze_interactions, generate_pymol_script
 from src.step7_advanced import (
     aggregate_replicates,
-    assess_structure_quality,
-    assess_ligand_compatibility,
-    assess_ligand_chemical_state,
     assess_enzyme_readiness,
-    audit_receptor_state,
+    assess_ligand_chemical_state,
+    assess_ligand_compatibility,
+    assess_structure_quality,
     audit_docking_box,
-    build_execution_plan,
+    audit_receptor_state,
+    auto_configure_receptor,
     build_capability_report,
-    enforce_capability_gate,
-    write_conformer_summary,
+    build_execution_plan,
     detect_catalytic_cys,
+    enforce_capability_gate,
     run_optional_plip,
-    write_ligand_compatibility_report,
     write_chemical_state_report,
+    write_conformer_summary,
+    write_ligand_compatibility_report,
 )
-from src.mechanism_templates import load_mechanism_template, mechanism_capability
-from src.step8_dynamics import write_md_setup
+from src.step8_dynamics import refine_active_pose_in_pocket, write_md_setup
 from src.step9_qmmm import write_qmmm_input
 from src.system_upgrade import (
+    aggregate_ensemble_results,
+    aggregate_multi_box_results,
     append_run_history,
     audit_structure_repair,
+    build_covalent_complex_and_manifest,
     build_engine_consensus_plan,
     build_flexible_receptor_plan,
     build_multi_box_plan,
@@ -49,6 +62,7 @@ from src.system_upgrade import (
 )
 
 LOGGER = logging.getLogger("main")
+_SUMMARY_LOCK = threading.Lock()
 
 
 def load_config(path: Path) -> dict:
@@ -57,21 +71,22 @@ def load_config(path: Path) -> dict:
 
 
 def update_interaction_summary(summary_path: Path, ligand_name: str, interactions: pd.DataFrame) -> None:
-    if not summary_path.exists():
-        return
-    summary = pd.read_csv(summary_path)
-    if "Ligand" not in summary.columns:
-        return
-    for column in ("HBond_Residues", "Hydrophobic_Residues"):
-        if column not in summary.columns:
-            summary[column] = ""
-        summary[column] = summary[column].astype("object")
-    mask = summary["Ligand"].astype(str) == ligand_name
-    hbond = sorted(interactions.loc[interactions["Type"] == "Hydrogen_Bond", "Receptor_Res"].unique())
-    hydro = sorted(interactions.loc[interactions["Type"] == "Hydrophobic_Contact", "Receptor_Res"].unique())
-    summary.loc[mask, "HBond_Residues"] = ", ".join(hbond)
-    summary.loc[mask, "Hydrophobic_Residues"] = ", ".join(hydro)
-    summary.to_csv(summary_path, index=False)
+    with _SUMMARY_LOCK:
+        if not summary_path.exists():
+            return
+        summary = pd.read_csv(summary_path)
+        if "Ligand" not in summary.columns:
+            return
+        for column in ("HBond_Residues", "Hydrophobic_Residues"):
+            if column not in summary.columns:
+                summary[column] = ""
+            summary[column] = summary[column].astype("object")
+        mask = summary["Ligand"].astype(str) == ligand_name
+        hbond = sorted(interactions.loc[interactions["Type"] == "Hydrogen_Bond", "Receptor_Res"].unique())
+        hydro = sorted(interactions.loc[interactions["Type"] == "Hydrophobic_Contact", "Receptor_Res"].unique())
+        summary.loc[mask, "HBond_Residues"] = ", ".join(hbond)
+        summary.loc[mask, "Hydrophobic_Residues"] = ", ".join(hydro)
+        summary.to_csv(summary_path, index=False)
 
 
 def preflight(config_path: Path) -> int:
@@ -113,18 +128,42 @@ def preflight(config_path: Path) -> int:
     return 0
 
 
-def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = False) -> None:
+def _pose_rank_key(summary_row: dict) -> tuple[int, float, float]:
+    competent = 0 if str(summary_row.get("Catalytically_Competent")) == "True" else 1
+    aff_raw = summary_row.get("Binding_Affinity_kcal_mol", "")
+    aff = float(aff_raw) if aff_raw not in ("", None) else float("inf")
+    nuc_raw = summary_row.get("d_nuc_A", "")
+    nuc = float(nuc_raw) if nuc_raw not in ("", None) else float("inf")
+    return (competent, aff, nuc)
+
+
+def run(
+    config_path: Path,
+    skip_vina: bool = False,
+    allow_specialized: bool = False,
+    use_cache: bool = True,
+    max_workers: int | None = None,
+) -> None:
     root = config_path.parent.parent
     config = load_config(config_path)
     configure_logging(config["project"].get("log_level", "INFO"))
     receptor_input = resolve_path(root, config["receptor"]["input_pdb"])
     receptor_out = root / "data" / "03_prepped_receptors"
     advanced = config.get("advanced", {})
+    safety_cfg = config.get("safety", {})
+    enzyme_cfg = config.get("enzyme", {})
+    auto_remediate_chem = bool(safety_cfg.get("auto_remediate_chemical_state", True))
+    experimental_ph = float(safety_cfg.get("experimental_ph", 7.4))
+    workers = max(1, int(max_workers or config["project"].get("max_workers", 1)))
+
+    config["ligands"] = discover_raw_ligands(root / "data" / "02_raw_ligands", config.get("ligands", []))
+
     mechanism = load_mechanism_template(
         root,
-        config.get("enzyme", {}).get("mechanism_family", "aldh"),
+        enzyme_cfg.get("mechanism_family", "aldh"),
     )
     mechanism_info = mechanism_capability(mechanism)
+
     if advanced.get("auto_detect_catalytic_cys"):
         detected = detect_catalytic_cys(
             receptor_input,
@@ -133,20 +172,52 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
         )
         config["receptor"]["catalytic_residue"] = detected
         LOGGER.info("Auto-detected catalytic Cys: %s", detected)
-    initial_box = locate_box(
+    auto_configure_receptor(receptor_input, config)
+
+    cat_num = int(config["receptor"].get("catalytic_residue", {}).get("number", 302))
+    template = config["receptor"].get("template_pdb")
+    template_path = resolve_path(root, template) if template else None
+    cleaned, receptor_pdbqt = prepare_receptor(
         receptor_input,
+        receptor_out,
         config["receptor"]["chain_id"],
-        config["receptor"]["catalytic_residue"]["number"],
-        (
-            config["docking_box"]["size_x"],
-            config["docking_box"]["size_y"],
-            config["docking_box"]["size_z"],
-        ),
-        config["docking_box"]["offset_outward"],
-        config["docking_box"].get("center_mode", "midpoint_if_cofactor"),
+        set(config["receptor"]["keep_cofactors"]),
+        template_path,
+        config["receptor"].get("cofactor_chain"),
+        enzyme_cfg.get("conserved_waters", []),
+        cat_num,
+        auto_retain_bridging_waters=bool(enzyme_cfg.get("auto_retain_bridging_waters", False)),
+        optimize_cofactor_in_state=bool(config["receptor"].get("optimize_cofactor_in_state", False)),
     )
+
+    pka_audit = estimate_receptor_microenvironment_pka(
+        cleaned,
+        chain_id=config["receptor"]["chain_id"],
+        ph=experimental_ph,
+        catalytic_resseq=cat_num,
+    )
+    (root / "reports" / "receptor_pka_audit.json").write_text(json.dumps(pka_audit, indent=2), encoding="utf-8")
+
+    flex_residues = enzyme_cfg.get("flexible_residues", []) or []
+    rigid_receptor_pdbqt, flex_receptor_pdbqt = prepare_flexible_receptor_pdbqt(
+        cleaned,
+        receptor_pdbqt,
+        receptor_out,
+        config["receptor"]["chain_id"],
+        flex_residues,
+    )
+
+    if config.get("docking_box", {}).get("auto_discover_pockets"):
+        discovered = discover_binding_pockets(
+            cleaned,
+            chain_id=config["receptor"]["chain_id"],
+            top_k=int(config["docking_box"].get("max_discovered_pockets", 3)),
+        )
+        config.setdefault("docking_box", {})["candidates"] = discovered
+
+    initial_box = locate_mechanism_box(cleaned, config)
     box_audit = audit_docking_box(
-        receptor_input,
+        cleaned,
         initial_box,
         config,
         root / "reports" / "docking_box_audit.json",
@@ -166,18 +237,26 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
         config,
         root / "reports" / "execution_plan.json",
     )
-    assess_structure_quality(receptor_input, root / "reports" / "receptor_quality.json", config["receptor"]["chain_id"])
+    assess_structure_quality(cleaned, root / "reports" / "receptor_quality.json", config["receptor"]["chain_id"])
+
     compatibility = []
     chemical_states = []
     for ligand in config["ligands"]:
         if ligand.get("smiles"):
-            assessment = assess_ligand_compatibility(ligand["name"], ligand["smiles"])
             chemical_state = assess_ligand_chemical_state(
                 ligand["name"],
                 ligand["smiles"],
-                float(config.get("safety", {}).get("experimental_ph", 7.4)),
+                experimental_ph,
             )
-            if chemical_state["flags"]:
+            effective_smiles = (
+                chemical_state["desalted_smiles"]
+                if auto_remediate_chem and chemical_state.get("was_desalted")
+                else ligand["smiles"]
+            )
+            if auto_remediate_chem and chemical_state.get("was_desalted"):
+                ligand["smiles"] = effective_smiles
+            assessment = assess_ligand_compatibility(ligand["name"], effective_smiles)
+            if chemical_state["flags"] and not auto_remediate_chem:
                 assessment["flags"].extend(
                     f"chemical_state:{flag}" for flag in chemical_state["flags"]
                 )
@@ -187,19 +266,24 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
             compatibility.append(assessment)
             chemical_states.append(chemical_state)
             if assessment["flags"]:
-                LOGGER.warning("%s requires manual review before biological interpretation: %s", ligand["name"], "; ".join(assessment["flags"]))
+                LOGGER.warning(
+                    "%s requires review before biological interpretation: %s",
+                    ligand["name"],
+                    "; ".join(assessment["flags"]),
+                )
     write_ligand_compatibility_report(compatibility, root / "reports" / "ligand_compatibility.json")
     write_chemical_state_report(
         chemical_states,
         root / "reports" / "chemical_state.json",
     )
+
     enzyme_readiness = assess_enzyme_readiness(
-        receptor_input,
+        cleaned,
         config,
         root / "reports" / "enzyme_readiness.json",
     )
     receptor_state = audit_receptor_state(
-        receptor_input,
+        cleaned,
         config,
         root / "reports" / "receptor_state.json",
     )
@@ -208,6 +292,10 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
     capability["receptor_state"] = {
         "status": receptor_state["status"],
         "flags": receptor_state["flags"],
+    }
+    capability["receptor_pka_summary"] = {
+        "active_site_residue_count": pka_audit["active_site_residue_count"],
+        "report": str(root / "reports" / "receptor_pka_audit.json"),
     }
     capability["docking_box"] = {
         "status": box_audit["status"],
@@ -219,7 +307,11 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
         "flags": execution_plan["flags"],
     }
     capability["system_upgrade"] = {
-        "structure_repair": {"status": repair_audit["status"], "flags": repair_audit["flags"]},
+        "structure_repair": {
+            "status": repair_audit["status"],
+            "post_prep_status": repair_audit.get("post_prep_status", repair_audit["status"]),
+            "flags": repair_audit["flags"],
+        },
         "multi_box": {"status": multi_box_plan["status"], "flags": multi_box_plan["flags"]},
         "flexibility": {"status": flexible_plan["status"], "flags": flexible_plan["flags"]},
         "engine_consensus": {"status": engine_plan["status"], "flags": engine_plan["flags"]},
@@ -284,6 +376,7 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
                 "capability_gate": gate,
                 "receptor_state_status": receptor_state["status"],
                 "receptor_state_flags": receptor_state["flags"],
+                "receptor_pka_audit": str(root / "reports" / "receptor_pka_audit.json"),
                 "docking_box_status": box_audit["status"],
                 "docking_box_flags": box_audit["flags"],
                 "execution_plan_status": execution_plan["status"],
@@ -298,7 +391,7 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
                     "system_coverage": str(root / "reports" / "system_coverage.json"),
                 },
                 "system_coverage_count": coverage["count"],
-                "experimental_ph": config.get("safety", {}).get("experimental_ph", 7.4),
+                "experimental_ph": experimental_ph,
                 "chemical_state_report": str(root / "reports" / "chemical_state.json"),
                 "mode": "preparation_only" if skip_vina else "docking",
                 "allow_specialized": allow_specialized,
@@ -311,30 +404,17 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
     if gate["manual_review_ligands"] or gate["enzyme_review_flags"]:
         LOGGER.warning("Capability review required before biological interpretation.")
     if advanced.get("replicates", {}).get("count", 1) > 1:
-        LOGGER.info("Replicate stability uses conservative heuristic thresholds: affinity SD <= 1.0 kcal/mol, catalytic distance SD <= 0.75 A, competence fraction >= 0.5.")
-    template = config["receptor"].get("template_pdb")
-    template_path = resolve_path(root, template) if template else None
-    cleaned, receptor_pdbqt = prepare_receptor(
-        receptor_input,
-        receptor_out,
-        config["receptor"]["chain_id"],
-        set(config["receptor"]["keep_cofactors"]),
-        template_path,
-        config["receptor"].get("cofactor_chain"),
-    )
-    box = locate_box(
-        cleaned,
-        config["receptor"]["chain_id"],
-        config["receptor"]["catalytic_residue"]["number"],
-        (
-            config["docking_box"]["size_x"],
-            config["docking_box"]["size_y"],
-            config["docking_box"]["size_z"],
-        ),
-        config["docking_box"]["offset_outward"],
-        config["docking_box"].get("center_mode", "midpoint_if_cofactor"),
-    )
-    for ligand in config["ligands"]:
+        LOGGER.info(
+            "Replicate stability uses conservative heuristic thresholds: affinity SD <= 1.0 kcal/mol, "
+            "catalytic distance SD <= 0.75 A, competence fraction >= 0.5, symmetry-corrected 3D pose RMSD <= 2.0 A."
+        )
+
+    box = initial_box
+    candidate_boxes = config.get("docking_box", {}).get("candidates", []) or []
+    multi_box_rows: list[dict] = []
+    ensemble_rows: list[dict] = []
+
+    def _process_single_ligand(ligand: dict) -> None:
         ligand_assessment = next((row for row in compatibility if row["name"] == ligand["name"]), {})
         pdbqt = prepare_ligand(ligand["name"], ligand.get("smiles"), root / "data" / "04_prepped_ligands")
         sugar_conformers = []
@@ -348,25 +428,28 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
                 float(sugar_cfg.get("rmsd_threshold", 0.5)),
             )
             LOGGER.warning("Generated %d sugar conformers for %s; see %s", len(sugar_conformers), ligand["name"], manifest_path)
+        variant_paths = []
         if advanced.get("ligand_variants", {}).get("enabled") and ligand.get("smiles"):
-            prepare_ligand_variants(
+            variant_paths = prepare_ligand_variants(
                 ligand["name"],
                 ligand["smiles"],
                 root / "data" / "04_prepped_ligands" / "variants",
-                advanced["ligand_variants"].get("max_variants", 8),
+                int(advanced["ligand_variants"].get("max_variants", 8)),
+                ph=experimental_ph,
             )
         if skip_vina:
             LOGGER.info("Prepared %s; skipping Vina.", ligand["name"])
-            continue
+            return
+
         if sugar_conformers and advanced.get("polysaccharide", {}).get("dock_conformer_ensemble", True):
             conformer_rows = []
             for conformer_path in sugar_conformers:
                 conformer_name = conformer_path.stem
                 sugar_output, _ = run_vina(
-                    config["vina"]["executable"], receptor_pdbqt, conformer_path, box,
+                    config["vina"]["executable"], rigid_receptor_pdbqt, conformer_path, box,
                     root / "data" / "05_docking_outputs" / "polysaccharides",
                     conformer_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
-                    config["vina"]["energy_range"], None,
+                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
                 )
                 conformer_summary = score_docking(
                     sugar_output, cleaned, ligand["name"], config,
@@ -374,28 +457,135 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
                 )
                 conformer_summary["Conformer"] = conformer_name
                 conformer_rows.append(conformer_summary)
-            write_conformer_summary(conformer_rows, root / "reports" / "polysaccharides" / f"{ligand['name']}_conformer_summary.csv")
+            write_conformer_summary(
+                conformer_rows,
+                root / "reports" / "polysaccharides" / f"{ligand['name']}_conformer_summary.csv",
+            )
             LOGGER.warning("Polysaccharide results remain per-conformer; do not interpret the best Vina score as a binding free energy.")
+
+        active_ligand_pdbqt = pdbqt
+        if variant_paths and advanced.get("ligand_variants", {}).get("dock_variants", False) and len(variant_paths) > 1:
+            best_var_summary = None
+            best_var_pdbqt = pdbqt
+            for var_pdbqt in variant_paths:
+                var_name = var_pdbqt.stem
+                var_out, _ = run_vina(
+                    config["vina"]["executable"], rigid_receptor_pdbqt, var_pdbqt, box,
+                    root / "data" / "05_docking_outputs" / "variants",
+                    var_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
+                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
+                )
+                var_sum = score_docking(
+                    var_out, cleaned, ligand["name"], config,
+                    root / "reports" / "variants" / var_name,
+                )
+                if best_var_summary is None or _pose_rank_key(var_sum) < _pose_rank_key(best_var_summary):
+                    best_var_summary = var_sum
+                    best_var_pdbqt = var_pdbqt
+            active_ligand_pdbqt = best_var_pdbqt
+
+        selected_box = box
+        if len(candidate_boxes) > 1:
+            best_box_summary = None
+            for box_idx, cand_box_cfg in enumerate(candidate_boxes, 1):
+                box_name = str(cand_box_cfg.get("name", f"box{box_idx}"))
+                cand_box = locate_mechanism_box(cleaned, config, cand_box_cfg)
+                box_run_name = f"{ligand['name']}__{box_name}"
+                box_out, _ = run_vina(
+                    config["vina"]["executable"], rigid_receptor_pdbqt, active_ligand_pdbqt, cand_box,
+                    root / "data" / "05_docking_outputs" / "multi_box",
+                    box_run_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
+                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
+                )
+                box_sum = score_docking(
+                    box_out, cleaned, ligand["name"], config,
+                    root / "reports" / "multi_box" / box_run_name,
+                )
+                box_sum["Box_Name"] = box_name
+                with _SUMMARY_LOCK:
+                    multi_box_rows.append(box_sum)
+                if best_box_summary is None or _pose_rank_key(box_sum) < _pose_rank_key(best_box_summary):
+                    best_box_summary = box_sum
+                    selected_box = cand_box
+
         replicate_count = int(advanced.get("replicates", {}).get("count", 1))
         seeds = advanced.get("replicates", {}).get("seeds", [])
         replicate_rows = []
-        output = None
+        best_rep_output: Path | None = None
+        best_rep_summary: dict | None = None
+
         for replicate in range(max(1, replicate_count)):
             seed = seeds[replicate % len(seeds)] if seeds else None
             run_name = ligand["name"] if replicate_count == 1 else f'{ligand["name"]}__rep{replicate + 1}'
-            output, _ = run_vina(config["vina"]["executable"], receptor_pdbqt, pdbqt, box, root / "data" / "05_docking_outputs", run_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"], config["vina"]["energy_range"], seed)
+            rep_output, _ = run_vina(
+                config["vina"]["executable"],
+                rigid_receptor_pdbqt,
+                active_ligand_pdbqt,
+                selected_box,
+                root / "data" / "05_docking_outputs",
+                run_name,
+                config["vina"]["exhaustiveness"],
+                config["vina"]["num_modes"],
+                config["vina"]["energy_range"],
+                seed,
+                use_cache=use_cache,
+                flex_pdbqt=flex_receptor_pdbqt,
+            )
             if replicate_count > 1:
-                replicate_summary = score_docking(output, cleaned, ligand["name"], config, root / "reports" / "replicates" / run_name)
+                replicate_summary = score_docking(
+                    rep_output,
+                    cleaned,
+                    ligand["name"],
+                    config,
+                    root / "reports" / "replicates" / run_name,
+                )
                 replicate_rows.append(replicate_summary)
-        assert output is not None
+                if best_rep_summary is None or _pose_rank_key(replicate_summary) < _pose_rank_key(best_rep_summary):
+                    best_rep_summary = replicate_summary
+                    best_rep_output = rep_output
+            else:
+                best_rep_output = rep_output
+
+        assert best_rep_output is not None
+        canonical_output = root / "data" / "05_docking_outputs" / f"{ligand['name']}_out.pdbqt"
         if replicate_count > 1:
-            aggregate_replicates(replicate_rows, root / "reports" / "consensus_summary.csv")
-            output, _ = run_vina(config["vina"]["executable"], receptor_pdbqt, pdbqt, box, root / "data" / "05_docking_outputs", ligand["name"], config["vina"]["exhaustiveness"], config["vina"]["num_modes"], config["vina"]["energy_range"], seeds[0] if seeds else None)
-        summary = score_docking(output, cleaned, ligand["name"], config, root / "reports")
-        interactions = analyze_interactions(Path(summary["active_pose"]), root / "reports" / "interactions" / f'{ligand["name"]}_interactions.csv', config["receptor"]["catalytic_residue"]["number"])
+            with _SUMMARY_LOCK:
+                aggregate_replicates(replicate_rows, root / "reports" / "consensus_summary.csv")
+            if best_rep_output.resolve() != canonical_output.resolve():
+                shutil.copyfile(best_rep_output, canonical_output)
+            output = canonical_output
+        else:
+            output = best_rep_output
+
+        with _SUMMARY_LOCK:
+            summary = score_docking(output, cleaned, ligand["name"], config, root / "reports")
+            summary["Receptor"] = receptor_input.stem
+            ensemble_rows.append(dict(summary))
+
+        refine_active_pose_in_pocket(
+            Path(summary["active_pose"]),
+            root / "reports" / "active_poses" / f"{ligand['name']}_refined.pdb",
+            catalytic_resseq=cat_num,
+        )
+
+        interactions = analyze_interactions(
+            Path(summary["active_pose"]),
+            root / "reports" / "interactions" / f'{ligand["name"]}_interactions.csv',
+            cat_num,
+            target_chain=config["receptor"]["chain_id"],
+        )
         update_interaction_summary(root / "reports" / "docking_summary.csv", ligand["name"], interactions)
         try:
-            generate_pymol_script(Path(summary["active_pose"]), interactions, root / "reports" / "figures", ligand["name"], config["visualization"]["pymol_executable"])
+            generate_pymol_script(
+                Path(summary["active_pose"]),
+                interactions,
+                root / "reports" / "figures",
+                ligand["name"],
+                config["visualization"]["pymol_executable"],
+                target_chain=config["receptor"]["chain_id"],
+                png_width=int(config.get("visualization", {}).get("png_width", 2400)),
+                png_height=int(config.get("visualization", {}).get("png_height", 1800)),
+            )
         except FileNotFoundError as exc:
             LOGGER.warning("PyMOL not available; script was not rendered: %s", exc)
         if advanced.get("plip", {}).get("enabled"):
@@ -404,15 +594,89 @@ def run(config_path: Path, skip_vina: bool = False, allow_specialized: bool = Fa
             write_md_setup(Path(summary["active_pose"]), root / "reports" / "md", advanced["md"])
         if advanced.get("qmmm", {}).get("enabled"):
             write_qmmm_input(Path(summary["active_pose"]), root / "reports" / "qmmm", advanced["qmmm"])
+        if advanced.get("covalent", {}).get("enabled") or any(
+            flag.endswith("requires_covalent_docking_or_qm_mm") for flag in ligand_assessment.get("flags", [])
+        ):
+            build_covalent_complex_and_manifest(Path(summary["active_pose"]), config, root / "reports" / "covalent")
+
+    if workers > 1 and len(config["ligands"]) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process_single_ligand, lig) for lig in config["ligands"]]
+            for fut in futures:
+                fut.result()
+    else:
+        for ligand in config["ligands"]:
+            _process_single_ligand(ligand)
+
+    if multi_box_rows:
+        aggregate_multi_box_results(multi_box_rows, root / "reports" / "multi_box_results.csv")
+
+    if not skip_vina and advanced.get("receptor_ensemble", {}).get("enabled"):
+        for ens_idx, ens_input in enumerate(advanced.get("receptor_ensemble", {}).get("inputs", []), start=2):
+            ens_path = resolve_path(root, ens_input)
+            if not ens_path.is_file():
+                continue
+            ens_stem = ens_path.stem
+            ens_out_dir = root / "data" / "03_prepped_receptors" / f"ensemble_{ens_idx}_{ens_stem}"
+            ens_cleaned, ens_pdbqt = prepare_receptor(
+                ens_path,
+                ens_out_dir,
+                config["receptor"]["chain_id"],
+                set(config["receptor"]["keep_cofactors"]),
+                template_path,
+                config["receptor"].get("cofactor_chain"),
+                enzyme_cfg.get("conserved_waters", []),
+                cat_num,
+            )
+            ens_box = locate_mechanism_box(ens_cleaned, config)
+            for ligand in config["ligands"]:
+                lig_pdbqt = root / "data" / "04_prepped_ligands" / f"{ligand['name']}.pdbqt"
+                ens_run_name = f"{ens_stem}__{ligand['name']}"
+                ens_dock_out, _ = run_vina(
+                    config["vina"]["executable"],
+                    ens_pdbqt,
+                    lig_pdbqt,
+                    ens_box,
+                    root / "data" / "05_docking_outputs" / "ensemble" / ens_stem,
+                    ens_run_name,
+                    config["vina"]["exhaustiveness"],
+                    config["vina"]["num_modes"],
+                    config["vina"]["energy_range"],
+                    None,
+                    use_cache=use_cache,
+                )
+                ens_sum = score_docking(
+                    ens_dock_out,
+                    ens_cleaned,
+                    ligand["name"],
+                    config,
+                    root / "reports" / "ensemble" / ens_stem,
+                )
+                ens_sum["Receptor"] = ens_stem
+                ensemble_rows.append(dict(ens_sum))
+        if len(ensemble_rows) > len(config["ligands"]):
+            aggregate_ensemble_results(ensemble_rows, root / "reports" / "ensemble_consensus.csv")
+
+    if not skip_vina and advanced.get("evaluation", {}).get("enabled"):
+        exp_csv = resolve_path(root, advanced["evaluation"].get("experimental_csv", "data/experimental_activity.csv"))
+        if exp_csv.is_file() and (root / "reports" / "docking_summary.csv").is_file():
+            metrics = evaluate_experimental_data(
+                root / "reports" / "docking_summary.csv",
+                exp_csv,
+                root / "reports" / "evaluation_results.csv",
+            )
+            (root / "reports" / "evaluation_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mechanism-guided ALDH AutoDock Vina pipeline")
+    parser = argparse.ArgumentParser(description="Universal Mechanism-Guided AutoDock Vina Pipeline v4.0")
     parser.add_argument("--config", type=Path, default=Path("config/pipeline_config.yaml"))
     parser.add_argument("--skip-vina", action="store_true", help="Prepare ligands/receptor only")
     parser.add_argument("--preflight", action="store_true", help="Check inputs and external dependencies without running")
     parser.add_argument("--allow-specialized", action="store_true", help="Explicitly allow exploratory runs for specialized systems")
+    parser.add_argument("--no-cache", action="store_true", help="Force re-execution of Vina even when checkpoint cache matches")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel worker threads for batch ligand screening")
     args = parser.parse_args()
     if args.preflight:
         raise SystemExit(preflight(args.config))
-    run(args.config, args.skip_vina, args.allow_specialized)
+    run(args.config, args.skip_vina, args.allow_specialized, use_cache=not args.no_cache, max_workers=args.workers)

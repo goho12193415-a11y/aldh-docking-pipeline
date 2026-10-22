@@ -1,0 +1,18 @@
+name: glycosidase
+display_name: 糖苷酶 / 碳水化合物活性酶
+status: implemented
+description: 催化双羧酸残基（ASP/GLU 亲核体与酸碱残基）协同作用于糖苷键或底物极性中心。
+required_roles:
+  catalytic_residue:
+    residue_names: [ASP, GLU]
+    required_atoms: [OD1, OD2, OE1, OE2]
+  acid_base_residue:
+    residue_names: [ASP, GLU]
+    required_atoms: [OD1, OD2, OE1, OE2]
+box_strategy: catalytic_residue_center
+scoring_strategy: glycosidase_dyad_geometry
+default_thresholds:
+  d_nuc_min: 2.5
+  d_nuc_max: 4.8
+interpretation_limits:
+  - Glycosidic ring distortion (chair/boat/skew-boat) requires carbohydrate force-field or QM/MM validation.

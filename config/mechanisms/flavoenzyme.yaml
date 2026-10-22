@@ -1,0 +1,16 @@
+name: flavoenzyme
+display_name: 黄素酶（FAD/FMN 依赖型氧化还原酶）
+status: implemented
+description: 以 FAD 或 FMN 辅因子异咯嗪环（N5/C4X/C4A）为反应核心，评估底物反应位点到 N5/C4X 的氢转移/电子转移几何。
+required_roles:
+  cofactor:
+    residue_names: [FAD, FMN]
+    required_atoms: [N5, C4X, C4A]
+box_strategy: flavin_n5_center
+scoring_strategy: flavoenzyme_n5_transfer_geometry
+default_thresholds:
+  d_nuc_min: 2.6
+  d_nuc_max: 5.0
+  d_hyd_max: 5.0
+interpretation_limits:
+  - Flavin redox state (oxidized quinone vs reduced hydroquinone) affects electrostatics.

@@ -1,0 +1,12 @@
+name: general_binding
+display_name: 通用蛋白-配体结合（无先验位点/自动口袋发现）
+status: implemented
+description: 面向非酶靶点（受体、通道、PPI 界面、变构口袋）或未知位点体系，自动通过三维网格空腔扫描识别结合口袋并结合物理化学能量重打分。
+required_roles: {}
+box_strategy: auto_cavity_discovery
+scoring_strategy: universal_physicochemical_and_contact_scoring
+default_thresholds:
+  d_nuc_min: 2.0
+  d_nuc_max: 6.0
+interpretation_limits:
+  - Universal cavity docking ranks poses by Vina affinity, physicochemical rescore, and pocket burial without assuming covalent catalysis.

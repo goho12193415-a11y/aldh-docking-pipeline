@@ -1,7 +1,7 @@
 name: cysteine_protease
 display_name: 半胱氨酸蛋白酶
-status: audit_only
-description: 为催化半胱氨酸、组氨酸和酸性残基提供模板接口；当前仅支持准备与审计。
+status: implemented
+description: 催化半胱氨酸（CYS-SG）与组氨酸（HIS-ND1/NE2）形成离子对，对底物羰基或亲电弹头碳原子进行亲核进攻。
 required_roles:
   catalytic_residue:
     residue_names: [CYS]
@@ -10,7 +10,11 @@ required_roles:
     residue_names: [HIS]
     required_atoms: [ND1, NE2]
 box_strategy: catalytic_residue_center
-scoring_strategy: template_audit_only
+scoring_strategy: cysteine_protease_dyad_geometry
+default_thresholds:
+  d_nuc_min: 2.8
+  d_nuc_max: 4.5
+  d_oxy_max: 4.5
 interpretation_limits:
-  - Standard ALDH carbonyl/NAD geometry must not be used for this mechanism.
-  - Covalent reaction modeling requires a specialized workflow.
+  - Pre-reactive dyad geometry does not replace covalent bond formation energetics.
+  - Covalent warheads should be cross-checked with covalent docking or QM/MM.

@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -5,31 +6,53 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.step5_mechanism_scorer import clean_ligand_pdbqt, score_docking
-from src.step3_box_locator import locate_box
+from src.common import (
+    PDBParser,
+    compute_peoe_charges,
+    enumerate_ph_protonation_states,
+    estimate_receptor_microenvironment_pka,
+    parse_smiles_tokens,
+    standardize_and_desalt_smiles,
+)
+from src.mechanism_templates import list_supported_mechanisms, load_mechanism_template, mechanism_capability
+from src.step10_evaluation import _enrichment_factor, _pr_auc, _roc_auc
 from src.step1_ligand_prep import prepare_polysaccharide_conformers
+from src.step2_receptor_prep import (
+    detect_bridging_waters,
+    prepare_flexible_receptor_pdbqt,
+    prepare_receptor,
+    reconstruct_missing_sidechains,
+    transplant_cofactor,
+)
+from src.step3_box_locator import discover_binding_pockets, locate_box, locate_mechanism_box
+from src.step5_mechanism_scorer import clean_ligand_pdbqt, parse_models, parse_models_and_flex, score_docking
 from src.step7_advanced import (
-    assess_enzyme_readiness,
-    assess_ligand_compatibility,
-    assess_ligand_chemical_state,
-    audit_receptor_state,
-    audit_docking_box,
-    build_execution_plan,
-    build_capability_report,
     aggregate_replicates,
+    assess_enzyme_readiness,
+    assess_ligand_chemical_state,
+    assess_ligand_compatibility,
+    audit_docking_box,
+    audit_receptor_state,
+    build_capability_report,
+    build_execution_plan,
+    compute_pose_rmsd,
     detect_catalytic_cys,
     enforce_capability_gate,
 )
-from src.mechanism_templates import load_mechanism_template, mechanism_capability
+from src.step8_dynamics import refine_active_pose_in_pocket, write_md_setup
+from src.step9_qmmm import write_qmmm_input
 from src.system_upgrade import (
     audit_structure_repair,
+    build_covalent_complex_and_manifest,
     build_engine_consensus_plan,
     build_flexible_receptor_plan,
     build_multi_box_plan,
     build_workflow_readiness,
 )
-from src.step10_evaluation import _roc_auc
-from src.step10_evaluation import _enrichment_factor, _pr_auc
+
+
+def _pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element, altloc=" ", occ=1.00):
+    return f"{record:<6}{serial:5d} {name:>4s}{altloc}{resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}{occ:6.2f} 20.00          {element:>2s}"
 
 
 class GeometryTests(unittest.TestCase):
@@ -45,9 +68,6 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(line[76:78].strip(), "O")
 
     def test_scoring_prefers_lowest_energy_competent_pose(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element):
-            return f"{record:<6}{serial:5d} {name:>4s} {resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         config = {
             "receptor": {"catalytic_residue": {"number": 302, "chain": "A"}},
             "thresholds": {
@@ -58,19 +78,19 @@ class GeometryTests(unittest.TestCase):
             },
         }
         receptor = "\n".join([
-            pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 7.0, 0, 0, "S"),
+            _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 7.0, 0, 0, "S"),
             "END",
         ]) + "\n"
         docking = "\n".join([
             "REMARK VINA RESULT: -8.0 0.000 0.000",
             "MODEL        1",
-            pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 0, 0, 0, "OA"),
-            pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 1.2, 0, 0, "C"),
+            _pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 0, 0, 0, "OA"),
+            _pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 1.2, 0, 0, "C"),
             "ENDMDL",
             "REMARK VINA RESULT: -6.0 0.000 0.000",
             "MODEL        2",
-            pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 2.3, 0, 0, "OA"),
-            pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 3.5, 0, 0, "C"),
+            _pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 2.3, 0, 0, "OA"),
+            _pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 3.5, 0, 0, "C"),
             "ENDMDL",
         ]) + "\n"
         with TemporaryDirectory() as directory:
@@ -85,14 +105,11 @@ class GeometryTests(unittest.TestCase):
             self.assertTrue(result["Catalytically_Competent"])
 
     def test_box_uses_cofactor_midpoint_when_configured(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element):
-            return f"{record:<6}{serial:5d} {name:>4s} {resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         with TemporaryDirectory() as directory:
             path = Path(directory) / "receptor.pdb"
             path.write_text("\n".join([
-                pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0, 0, 0, "S"),
-                pdb_atom("HETATM", 2, "C4N", "NAD", "B", 5501, 10, 0, 0, "C"),
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0, 0, 0, "S"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "B", 5501, 10, 0, 0, "C"),
                 "END",
             ]) + "\n", encoding="utf-8")
             box = locate_box(path, "A", 302, (18.0, 18.0, 18.0), 2.0, "midpoint_if_cofactor")
@@ -101,15 +118,12 @@ class GeometryTests(unittest.TestCase):
             self.assertEqual(box["center_z"], 0.0)
 
     def test_advanced_cys_detection_maps_sequence_position(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element):
-            return f"{record:<6}{serial:5d} {name:>4s} {resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         with TemporaryDirectory() as directory:
             path = Path(directory) / "receptor.pdb"
             lines = []
             sequence = [("PHE", 298), ("GLY", 299), ("ALA", 300), ("CYS", 301)]
             for serial, (resname, number) in enumerate(sequence, 1):
-                lines.append(pdb_atom("ATOM", serial, "CA", resname, "A", number, serial, 0, 0, "C"))
+                lines.append(_pdb_atom("ATOM", serial, "CA", resname, "A", number, serial, 0, 0, "C"))
             path.write_text("\n".join(lines) + "\nEND\n", encoding="utf-8")
             result = detect_catalytic_cys(path, "A", [r"F.{0,3}G.{0,2}C"])
             self.assertEqual(result["number"], 301)
@@ -152,16 +166,13 @@ class GeometryTests(unittest.TestCase):
             self.assertTrue(manifest.is_file())
 
     def test_enzyme_readiness_checks_catalytic_residue_and_cofactor(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element):
-            return f"{record:<6}{serial:5d} {name:>4s} {resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         with TemporaryDirectory() as directory:
             root = Path(directory)
             pdb = root / "enzyme.pdb"
             pdb.write_text("\n".join([
-                pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 0, 0, 0, "C"),
-                pdb_atom("ATOM", 2, "SG", "CYS", "A", 302, 1, 0, 0, "S"),
-                pdb_atom("HETATM", 3, "C4N", "NAD", "A", 5501, 3, 0, 0, "C"),
+                _pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 0, 0, 0, "C"),
+                _pdb_atom("ATOM", 2, "SG", "CYS", "A", 302, 1, 0, 0, "S"),
+                _pdb_atom("HETATM", 3, "C4N", "NAD", "A", 5501, 3, 0, 0, "C"),
                 "END",
             ]) + "\n", encoding="utf-8")
             config = {
@@ -193,15 +204,12 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(result["interpretation_status"], "exploratory_override")
 
     def test_audit_receptor_state_reports_altloc_and_cofactor(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element, altloc=" "):
-            return f"{record:<6}{serial:5d} {name:>4s}{altloc}{resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         with TemporaryDirectory() as directory:
             root = Path(directory)
             pdb = root / "state.pdb"
             pdb.write_text("\n".join([
-                pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 0, 0, 0, "C", "A"),
-                pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 3, 0, 0, "C"),
+                _pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 0, 0, 0, "C", "A"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 3, 0, 0, "C"),
                 "END",
             ]) + "\n", encoding="utf-8")
             report = audit_receptor_state(
@@ -227,15 +235,12 @@ class GeometryTests(unittest.TestCase):
             )
 
     def test_docking_box_audit_detects_uncovered_catalytic_landmark(self):
-        def pdb_atom(record, serial, name, resname, chain, resseq, x, y, z, element):
-            return f"{record:<6}{serial:5d} {name:>4s} {resname:>3s} {chain}{resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2s}"
-
         with TemporaryDirectory() as directory:
             root = Path(directory)
             pdb = root / "box.pdb"
             pdb.write_text("\n".join([
-                pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0, 0, 0, "S"),
-                pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 10, 0, 0, "C"),
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0, 0, 0, "S"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 10, 0, 0, "C"),
                 "END",
             ]) + "\n", encoding="utf-8")
             report = audit_docking_box(
@@ -345,3 +350,342 @@ class GeometryTests(unittest.TestCase):
             self.assertEqual(result[0]["Stability_Status"], "unstable_manual_review_required")
             self.assertGreater(result[0]["Affinity_SD_kcal_mol"], 1.0)
             self.assertEqual(result[0]["Competence_Fraction"], 0.5)
+
+    def test_automated_desalting_and_ph_microstate_enumeration(self):
+        desalt = standardize_and_desalt_smiles("[NH3+]CC(=O)[O-].[Na+]")
+        self.assertTrue(desalt["was_desalted"])
+        self.assertEqual(desalt["desalted_smiles"], "[NH3+]CC(=O)[O-]")
+        self.assertEqual(desalt["stripped_counterions"], ["[Na+]"])
+        states = enumerate_ph_protonation_states("CCCCC(=O)O", ph=7.4)
+        labels = [item["label"] for item in states]
+        self.assertIn("carboxylate_deprotonated", labels)
+        self.assertIn("protonation_penalty_kcal_mol", states[0])
+
+    def test_receptor_prep_resolves_altloc_and_reconstructs_missing_oxygen(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_pdb = root / "raw.pdb"
+            raw_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "N", "ALA", "A", 1, 0.0, 0.0, 0.0, "N"),
+                _pdb_atom("ATOM", 2, "CA", "ALA", "A", 1, 1.45, 0.0, 0.0, "C", "A", 0.30),
+                _pdb_atom("ATOM", 3, "CA", "ALA", "A", 1, 1.48, 0.1, 0.0, "C", "B", 0.70),
+                _pdb_atom("ATOM", 4, "C", "ALA", "A", 1, 2.50, 1.1, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            cleaned, _ = prepare_receptor(raw_pdb, root / "out", "A", {"NAD"})
+            lines = [ln for ln in cleaned.read_text(encoding="utf-8").splitlines() if ln.startswith("ATOM")]
+            atom_names = [ln[12:16].strip() for ln in lines]
+            altlocs = {ln[16:17] for ln in lines}
+            self.assertEqual(atom_names, ["N", "CA", "C", "O"])
+            self.assertEqual(altlocs, {" "})
+
+    def test_sequence_aligned_cofactor_transplantation_handles_insertion_offset(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_pdb = root / "target.pdb"
+            template_pdb = root / "template.pdb"
+            motif = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "HIS", "ILE", "LEU", "LYS", "PHE"]
+            target_lines = [
+                _pdb_atom("ATOM", 1, "CA", "GLY", "A", 1, -5.0, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 2, "CA", "GLY", "A", 2, -2.5, 0.0, 0.0, "C"),
+            ]
+            template_lines = []
+            for idx, rname in enumerate(motif, start=1):
+                x = float(idx * 3.8)
+                target_lines.append(_pdb_atom("ATOM", idx + 2, "CA", rname, "A", idx + 2, x, 0.0, 0.0, "C"))
+                template_lines.append(_pdb_atom("ATOM", idx, "CA", rname, "A", idx, x, 0.0, 0.0, "C"))
+            template_lines.append(_pdb_atom("HETATM", 99, "C4N", "NAD", "A", 501, 20.0, 8.0, 0.0, "C"))
+            target_pdb.write_text("\n".join(target_lines + ["END"]) + "\n", encoding="utf-8")
+            template_pdb.write_text("\n".join(template_lines + ["END"]) + "\n", encoding="utf-8")
+            out_pdb = root / "transplanted.pdb"
+            audit = transplant_cofactor(target_pdb, template_pdb, out_pdb, "A", {"NAD"})
+            self.assertTrue(audit["transplanted"])
+            self.assertLess(audit["superposition_rmsd_A"], 0.01)
+            self.assertEqual(audit["aligned_ca_count"], 12)
+
+    def test_all_nine_universal_mechanism_templates_are_implemented(self):
+        project_root = Path(__file__).resolve().parents[1]
+        families = list_supported_mechanisms()
+        self.assertEqual(len(families), 9)
+        for family in families:
+            tmpl = load_mechanism_template(project_root, family)
+            cap = mechanism_capability(tmpl)
+            self.assertTrue(cap["implemented_scoring"], f"{family} should have implemented_scoring=True")
+
+    def test_adaptive_cofactor_conformation_scores_contracted_nad_pose(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            receptor_path = root / "receptor.pdb"
+            docking_path = root / "out.pdbqt"
+            receptor_path.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "N", "CYS", "A", 302, 69.0, 58.0, 65.0, "N"),
+                _pdb_atom("ATOM", 2, "SG", "CYS", "A", 302, 70.244, 58.419, 65.954, "S"),
+                _pdb_atom("ATOM", 3, "ND2", "ASN", "A", 169, 74.8, 56.5, 66.2, "N"),
+                _pdb_atom("HETATM", 4, "C4N", "NAD", "A", 5501, 73.787, 63.159, 62.551, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            docking_path.write_text("\n".join([
+                "REMARK VINA RESULT: -4.533 0.000 0.000",
+                "MODEL        1",
+                _pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 74.20, 57.60, 66.30, "OA"),
+                _pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 73.58, 58.61, 66.68, "C"),
+                "ENDMDL",
+            ]) + "\n", encoding="utf-8")
+            config = {
+                "receptor": {
+                    "chain_id": "A",
+                    "cofactor_chain": "A",
+                    "catalytic_residue": {"name": "CYS", "number": 302, "chain": "A"},
+                    "oxyanion_residue": {"name": "ASN", "number": 169, "atom": "ND2"},
+                },
+                "enzyme": {"mechanism_family": "aldh"},
+                "thresholds": {
+                    "carbonyl_bond_min": 1.15,
+                    "carbonyl_bond_max": 1.35,
+                    "d_nuc_min": 3.0,
+                    "d_nuc_max": 4.5,
+                    "d_hyd_max": 4.5,
+                    "adaptive_cofactor_hydride_max": True,
+                },
+            }
+            res = score_docking(docking_path, receptor_path, "Octanal", config, root / "reports")
+            self.assertTrue(res["Catalytically_Competent"])
+            self.assertEqual(res["Cofactor_Conformation"], "contracted_hydrolysis_out")
+            self.assertEqual(res["Reliability_Grade"], "A_High_Confidence_Catalytic")
+            self.assertIn("PhysChem_Score_kcal_mol", res)
+            self.assertIn("Universal_Consensus_Rank", res)
+
+    def test_pose_3d_rmsd_and_qmmm_md_extraction(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pose1 = root / "pose1.pdb"
+            pose2 = root / "pose2.pdb"
+            pose1.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 4.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 3.2, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "O1", "LIG", "L", 999, 3.2, 1.22, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            pose2.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("HETATM", 2, "C4N", "NAD", "A", 5501, 4.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 3.2, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "O1", "LIG", "L", 999, 3.2, 1.22, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            self.assertEqual(compute_pose_rmsd(pose1, pose2), 0.0)
+            qmmm_inp = write_qmmm_input(pose1, root / "qmmm", {"charge": 0, "multiplicity": 1, "qm_residues": ["CYS302", "NAD5501"]})
+            self.assertIn("Extracted QM atom count: 4", qmmm_inp.read_text(encoding="utf-8"))
+            md_json = write_md_setup(pose1, root / "md", {"engine": "gromacs", "steps": 1000, "temperature_K": 300.0})
+            self.assertTrue((root / "md" / "pose1_ligand.pdb").is_file())
+            self.assertTrue(md_json.is_file())
+
+    def test_3d_microenvironment_pka_and_missing_sidechain_reconstruction(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdb = root / "cys_incomplete.pdb"
+            pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "N", "CYS", "A", 302, 0.0, 0.0, 0.0, "N"),
+                _pdb_atom("ATOM", 2, "CA", "CYS", "A", 302, 1.46, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 3, "C", "CYS", "A", 302, 2.10, 1.40, 0.0, "C"),
+                _pdb_atom("ATOM", 4, "O", "CYS", "A", 302, 1.50, 2.45, 0.0, "O"),
+                _pdb_atom("ATOM", 5, "ND2", "ASN", "A", 169, 2.0, -2.2, 1.2, "N"),
+                _pdb_atom("HETATM", 6, "C4N", "NAD", "A", 501, 2.5, -1.8, -1.5, "C"),
+                _pdb_atom("HETATM", 7, "O", "HOH", "A", 601, 0.0, -2.8, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            structure = PDBParser(QUIET=True).get_structure("test", str(pdb))
+            reconstructed = reconstruct_missing_sidechains(structure, "A")
+            reconstructed_atoms = {item["reconstructed_atom"] for item in reconstructed}
+            self.assertIn("CB", reconstructed_atoms)
+            self.assertIn("SG", reconstructed_atoms)
+            waters = detect_bridging_waters(structure, "A", {"NAD"})
+            self.assertEqual(len(waters), 1)
+
+            cleaned, _ = prepare_receptor(pdb, root / "prep", "A", {"NAD"}, catalytic_residue_number=302, auto_retain_bridging_waters=True)
+            pka_report = estimate_receptor_microenvironment_pka(cleaned, "A", 7.4, catalytic_resseq=302)
+            cys_entry = next(r for r in pka_report["residues"] if r["number"] == 302)
+            self.assertLess(cys_entry["predicted_pka"], 7.4)
+            self.assertEqual(cys_entry["assigned_state_at_ph"], "CYM_thiolate(-1)")
+
+    def test_flexible_receptor_splitter_and_blind_cavity_discovery(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdb = root / "pocket.pdb"
+            pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "N", "PHE", "A", 170, 0.0, 0.0, 0.0, "N"),
+                _pdb_atom("ATOM", 2, "CA", "PHE", "A", 170, 1.45, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 3, "C", "PHE", "A", 170, 2.10, 1.35, 0.0, "C"),
+                _pdb_atom("ATOM", 4, "O", "PHE", "A", 170, 1.50, 2.40, 0.0, "O"),
+                _pdb_atom("ATOM", 5, "CB", "PHE", "A", 170, 1.95, -0.80, 1.20, "C"),
+                _pdb_atom("ATOM", 6, "CG", "PHE", "A", 170, 3.40, -0.90, 1.35, "C"),
+                _pdb_atom("ATOM", 7, "CD1", "PHE", "A", 170, 4.10, -1.80, 0.60, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            cleaned, pdbqt = prepare_receptor(pdb, root / "prep", "A", set())
+            rigid, flex = prepare_flexible_receptor_pdbqt(cleaned, pdbqt, root / "prep", "A", [170])
+            self.assertIsNotNone(flex)
+            assert flex is not None
+            flex_txt = flex.read_text(encoding="utf-8")
+            self.assertIn("BEGIN_RES PHE A  170", flex_txt)
+            # Verify nested chi2 BRANCH (CB -> CG) is emitted
+            self.assertEqual(flex_txt.count("BRANCH"), 4)
+            pockets = discover_binding_pockets(cleaned, "A", top_k=1)
+            self.assertEqual(len(pockets), 1)
+            gen_box = locate_mechanism_box(cleaned, {"enzyme": {"mechanism_family": "general_binding"}, "receptor": {"chain_id": "A"}})
+            self.assertIn("center_x", gen_box)
+
+    def test_covalent_adduct_builder_and_in_pocket_lbfgsb_refinement(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pose = root / "complex.pdb"
+            pose.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("ATOM", 2, "ND2", "ASN", "A", 169, 3.2, 2.1, 0.0, "N"),
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 2.15, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "O1", "LIG", "L", 999, 2.85, 1.05, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            cov_manifest = build_covalent_complex_and_manifest(
+                pose,
+                {"receptor": {"catalytic_residue": {"name": "CYS", "number": 302, "chain": "A"}}},
+                root / "covalent",
+            )
+            self.assertTrue(cov_manifest.is_file())
+            manifest_data = json.loads(cov_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(manifest_data["warhead_mechanism_type"], "carbonyl_sp2_to_sp3_hemithioacetal")
+            self.assertAlmostEqual(manifest_data["rehybridized_tetrahedral_angle_deg"], 109.47, delta=1.5)
+            adduct_pdb = root / "covalent" / "complex_covalent_adduct.pdb"
+            self.assertTrue(adduct_pdb.is_file())
+            self.assertIn("CONECT    1 9000", adduct_pdb.read_text(encoding="utf-8"))
+
+            refinement = refine_active_pose_in_pocket(pose, root / "complex_refined.pdb", catalytic_resseq=302)
+            self.assertTrue(refinement["refined"])
+            self.assertLessEqual(refinement["refined_pocket_energy_kcal"], refinement["initial_pocket_energy_kcal"])
+
+    def test_flex_output_parsing_separates_flex_residues_from_ligand_and_merges(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            receptor_pdb = root / "receptor.pdb"
+            docking_pdbqt = root / "flex_out.pdbqt"
+            receptor_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 7.0, 0.0, 0.0, "S"),
+                _pdb_atom("ATOM", 2, "CA", "PHE", "A", 170, 5.0, 2.0, 0.0, "C"),
+                _pdb_atom("ATOM", 3, "CB", "PHE", "A", 170, 5.0, 3.5, 0.0, "C"),
+                _pdb_atom("ATOM", 4, "CG", "PHE", "A", 170, 5.0, 5.0, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            docking_pdbqt.write_text("\n".join([
+                "REMARK VINA RESULT: -6.5 0.000 0.000",
+                "MODEL        1",
+                "ROOT",
+                _pdb_atom("ATOM", 1, "OA", "UNL", " ", 1, 2.3, 0.0, 0.0, "OA"),
+                _pdb_atom("ATOM", 2, "C1", "UNL", " ", 1, 3.5, 0.0, 0.0, "C"),
+                "ENDROOT",
+                "TORSDOF 1",
+                "BEGIN_RES PHE A  170",
+                "ROOT",
+                _pdb_atom("ATOM", 3, "CA", "PHE", "A", 170, 5.0, 2.0, 0.0, "C"),
+                "ENDROOT",
+                "BRANCH   3   4",
+                _pdb_atom("ATOM", 4, "CB", "PHE", "A", 170, 5.0, 3.5, 0.0, "C"),
+                _pdb_atom("ATOM", 5, "CG", "PHE", "A", 170, 6.2, 4.2, 1.1, "C"),
+                "ENDBRANCH   3   4",
+                "END_RES PHE A  170",
+                "ENDMDL",
+            ]) + "\n", encoding="utf-8")
+            models = parse_models(docking_pdbqt)
+            self.assertEqual(len(models[0]), 2)
+            pairs = parse_models_and_flex(docking_pdbqt)
+            self.assertEqual(len(pairs[0][0]), 2)
+            self.assertEqual(len(pairs[0][1]), 3)
+            config = {
+                "receptor": {"chain_id": "A", "catalytic_residue": {"number": 302, "chain": "A"}},
+                "thresholds": {"carbonyl_bond_min": 1.15, "carbonyl_bond_max": 1.35, "d_nuc_min": 3.0, "d_nuc_max": 4.5},
+            }
+            summary = score_docking(docking_pdbqt, receptor_pdb, "FlexLig", config, root / "reports")
+            active_lines = Path(summary["active_pose"]).read_text(encoding="utf-8").splitlines()
+            lig_lines = [ln for ln in active_lines if ln.startswith("HETATM") and ln[17:20].strip() == "LIG"]
+            phe_cg_lines = [ln for ln in active_lines if ln.startswith("ATOM") and ln[17:20].strip() == "PHE" and ln[12:16].strip() == "CG"]
+            self.assertEqual(len(lig_lines), 2)
+            self.assertIn("6.200   4.200   1.100", phe_cg_lines[0])
+
+    def test_vectorized_cavity_scanner_covers_spans_beyond_100_angstroms(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdb = root / "large_dimer.pdb"
+            lines = [_pdb_atom("ATOM", 1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0, "C")]
+            # Build a spherical shell of 24 protein atoms centered at (125.0, 0.0, 0.0) with radius 4.0 A
+            serial = 2
+            for dx in (-4.0, 0.0, 4.0):
+                for dy in (-4.0, 0.0, 4.0):
+                    for dz in (-4.0, 0.0, 4.0):
+                        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+                            continue
+                        lines.append(_pdb_atom("ATOM", serial, "CA", "LEU", "A", serial, 125.0 + dx, dy, dz, "C"))
+                        serial += 1
+            lines.append(_pdb_atom("HETATM", 99, "C4N", "NAD", "A", 501, 125.5, 0.5, 0.0, "C"))
+            pdb.write_text("\n".join(lines + ["END"]) + "\n", encoding="utf-8")
+            pockets = discover_binding_pockets(pdb, "A", top_k=1)
+            self.assertGreater(pockets[0]["center_x"], 115.0)
+
+    def test_lbfgsb_refinement_optimizes_internal_rotatable_torsions(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pose = root / "torsion_complex.pdb"
+            pose.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 0.0, 0.0, 0.0, "S"),
+                _pdb_atom("ATOM", 2, "CB", "PHE", "A", 170, 5.2, 1.5, 0.0, "C"),
+                _pdb_atom("HETATM", 9000, "O1", "LIG", "L", 999, 2.8, 1.2, 0.0, "O"),
+                _pdb_atom("HETATM", 9001, "C1", "LIG", "L", 999, 3.2, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9002, "C2", "LIG", "L", 999, 4.7, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9003, "C3", "LIG", "L", 999, 5.2, 1.4, 0.0, "C"),
+                _pdb_atom("HETATM", 9004, "C4", "LIG", "L", 999, 6.7, 1.4, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            res = refine_active_pose_in_pocket(pose, root / "refined.pdb", catalytic_resseq=302)
+            self.assertTrue(res["refined"])
+            self.assertGreaterEqual(res["optimized_torsion_count"], 1)
+            self.assertLess(res["refined_pocket_energy_kcal"], res["initial_pocket_energy_kcal"])
+
+    def test_peoe_topological_charges_and_coupled_zwitterion_microstates(self):
+        parsed = parse_smiles_tokens("CCC=O")
+        charges = compute_peoe_charges(parsed["atoms"], parsed["adj"])
+        # Carbonyl oxygen (index 3) is negative and carbonyl carbon (index 2) is positive
+        self.assertLess(charges[3], -0.15)
+        self.assertGreater(charges[2], 0.05)
+
+        zwitter = enumerate_ph_protonation_states("NCC(=O)O", ph=7.4)
+        smiles_set = {item["smiles"] for item in zwitter}
+        self.assertIn("[NH3+]CC(=O)[O-]", smiles_set)
+
+    def test_symmetry_corrected_hungarian_rmsd_handles_flipped_carboxylate(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pose1 = root / "p1.pdb"
+            pose2 = root / "p2.pdb"
+            pose1.write_text("\n".join([
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "C2", "LIG", "L", 999, 1.5, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9002, "O1", "LIG", "L", 999, 2.1, 1.1, 0.0, "O"),
+                _pdb_atom("HETATM", 9003, "O2", "LIG", "L", 999, 2.1, -1.1, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            # Swap O1 and O2 coordinates (180-degree carboxylate flip)
+            pose2.write_text("\n".join([
+                _pdb_atom("HETATM", 9000, "C1", "LIG", "L", 999, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9001, "C2", "LIG", "L", 999, 1.5, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 9002, "O1", "LIG", "L", 999, 2.1, -1.1, 0.0, "O"),
+                _pdb_atom("HETATM", 9003, "O2", "LIG", "L", 999, 2.1, 1.1, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            naive_rmsd = compute_pose_rmsd(pose1, pose2, symmetry_corrected=False)
+            sym_rmsd = compute_pose_rmsd(pose1, pose2, symmetry_corrected=True)
+            assert naive_rmsd is not None and sym_rmsd is not None
+            self.assertGreater(naive_rmsd, 1.5)
+            self.assertEqual(sym_rmsd, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

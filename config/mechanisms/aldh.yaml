@@ -1,7 +1,7 @@
 name: aldh
 display_name: 醛脱氢酶（ALDH）
 status: implemented
-description: 催化半胱氨酸与醛底物反应，并由 NAD 类辅因子参与电子转移。
+description: 催化半胱氨酸与醛底物发生亲核加成，结合氧阴离子穴稳定化，并由 NAD/NADP 辅因子参与氢负离子转移（自动识别辅因子 in/out 构象）。
 required_roles:
   catalytic_residue:
     residue_names: [CYS]
@@ -11,6 +11,13 @@ required_roles:
     required_atoms: [C4N, C4]
 box_strategy: catalytic_residue_to_cofactor_midpoint
 scoring_strategy: aldh_nucleophile_carbonyl_hydride_geometry
+default_thresholds:
+  carbonyl_bond_min: 1.15
+  carbonyl_bond_max: 1.35
+  d_nuc_min: 3.0
+  d_nuc_max: 4.5
+  d_hyd_max: 4.5
+  d_oxy_max: 5.0
 interpretation_limits:
   - Vina affinity is not a reaction barrier or binding free energy.
   - Catalytic geometry is not proof of covalent chemistry.

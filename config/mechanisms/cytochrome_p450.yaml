@@ -1,0 +1,15 @@
+name: cytochrome_p450
+display_name: 细胞色素 P450 / 血红素氧化酶
+status: implemented
+description: 血红素辅因子（HEM/HEC）中心铁离子（FE）作为催化中心，评估底物可氧化碳/杂原子到血红素铁的距离与取向。
+required_roles:
+  cofactor:
+    residue_names: [HEM, HEC, HEA]
+    required_atoms: [FE]
+box_strategy: heme_iron_center
+scoring_strategy: p450_heme_iron_oxidation_geometry
+default_thresholds:
+  d_nuc_min: 2.8
+  d_nuc_max: 5.5
+interpretation_limits:
+  - Geometric proximity to heme Fe identifies accessible oxidation sites but does not replace spin-state DFT barriers.

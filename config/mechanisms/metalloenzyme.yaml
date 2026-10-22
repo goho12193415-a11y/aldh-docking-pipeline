@@ -1,13 +1,16 @@
 name: metalloenzyme
 display_name: 金属酶
-status: audit_only
-description: 为金属中心、配位残基和保守水提供模板接口；当前不替代专用金属参数化。
+status: implemented
+description: 活性中心金属离子（Zn2+、Mg2+、Fe2+/3+、Mn2+ 等）通过第一配位层与配体杂原子（O/N/S）或羰基氧形成配位极化作用。
 required_roles:
   metal_center:
     residue_names: [ZN, MG, FE, MN, CA, CU, NI, CO]
     required_atoms: []
 box_strategy: metal_center
-scoring_strategy: template_audit_only
+scoring_strategy: metalloenzyme_coordination_geometry
+default_thresholds:
+  d_coord_min: 1.7
+  d_coord_max: 3.4
 interpretation_limits:
-  - Metal coordination and charge states require specialized validation.
-  - Standard Vina scores must not be interpreted as metal-binding thermodynamics.
+  - Coordination geometry screening identifies metal-chelating poses but does not replace quantum polarization or metal force-field parameterization.
+  - Standard Vina scores must not be interpreted as absolute metal-binding free energies.

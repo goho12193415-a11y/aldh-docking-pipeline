@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import argparse
 import copy
-import re
 import sys
 from pathlib import Path
 
 import yaml
-from Bio.PDB import PDBParser
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.step7_advanced import detect_catalytic_cys
+from src.common import PDBParser
+from src.step1_ligand_prep import discover_raw_ligands, fetch_smiles
+from src.step7_advanced import auto_configure_receptor, detect_catalytic_cys
 
 
 def _pick_chain(pdb_path: Path) -> tuple[str, dict]:
@@ -51,16 +51,27 @@ def _pick_chain(pdb_path: Path) -> tuple[str, dict]:
     return selected["chain"], rationale
 
 
-def _parse_ligands(values: list[str]) -> list[dict]:
+def _parse_ligands(values: list[str] | None, raw_dir: Path | None = None) -> list[dict]:
     ligands = []
-    for value in values:
-        if "=" not in value:
-            raise ValueError(f"Ligand must use Name=SMILES format: {value}")
-        name, smiles = value.split("=", 1)
-        name, smiles = name.strip(), smiles.strip()
-        if not name or not smiles:
-            raise ValueError(f"Ligand must have both name and SMILES: {value}")
-        ligands.append({"name": name, "smiles": smiles})
+    for value in values or []:
+        text = value.strip()
+        if not text:
+            continue
+        if "=" in text:
+            name, smiles = text.split("=", 1)
+            name, smiles = name.strip(), smiles.strip()
+            if not name or not smiles:
+                raise ValueError(f"Ligand must have both name and SMILES: {value}")
+            ligands.append({"name": name, "smiles": smiles})
+        else:
+            # Allow passing just a compound name (e.g. Hexanal) and auto-resolve from PubChem
+            name = text
+            smiles = fetch_smiles(name)
+            ligands.append({"name": name, "smiles": smiles})
+    if raw_dir is not None and raw_dir.is_dir():
+        ligands = discover_raw_ligands(raw_dir, ligands)
+    if not ligands:
+        raise ValueError("At least one ligand must be provided via --ligand or data/02_raw_ligands/.")
     return ligands
 
 
@@ -77,13 +88,14 @@ def create_quick_config(project_root: Path, receptor: Path, ligand_values: list[
     config["receptor"]["chain_id"] = chain
     config["receptor"]["cofactor_chain"] = chain
     config["receptor"]["template_pdb"] = None
-    config["ligands"] = _parse_ligands(ligand_values)
+    config["ligands"] = _parse_ligands(ligand_values, project_root / "data" / "02_raw_ligands")
     try:
         cys = detect_catalytic_cys(receptor, chain)
         config["receptor"]["catalytic_residue"] = cys
         config["advanced"]["auto_detect_catalytic_cys"] = True
     except (KeyError, ValueError):
         config["advanced"]["auto_detect_catalytic_cys"] = False
+    auto_configure_receptor(receptor, config)
     config["project"]["name"] = f"Quick_{receptor.stem}"
     config["project"]["auto_selection"] = selection
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +108,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Create an auto-configured docking experiment.")
     parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--receptor", type=Path, required=True)
-    parser.add_argument("--ligand", action="append", required=True, help="Name=SMILES; repeat for multiple ligands")
+    parser.add_argument("--ligand", action="append", default=[], help="Name=SMILES or Name; repeat for multiple ligands")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = args.output or args.project / "config" / "quick_config.yaml"
