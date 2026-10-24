@@ -455,4 +455,12 @@ set transparency, 72, hydro_pocket_surf
     else:
         command = [resolved, "-cq", str(script)]
     subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    status_path = figures_dir / f"{prefix}_render_status.json"
+    status_path.write_text(json.dumps({
+        "pymol_available": True,
+        "fallback_rendered": False,
+        "pse_present": pse.is_file(),
+        "png_present": png.is_file() and png.stat().st_size > 0,
+        "pymol_executable": str(resolved),
+    }, indent=2), encoding="utf-8")
     return script
