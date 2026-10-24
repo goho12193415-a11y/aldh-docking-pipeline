@@ -252,6 +252,10 @@ def run(
     auto_configure_receptor(receptor_input, config)
 
     cat_num = int(config["receptor"].get("catalytic_residue", {}).get("number", 302))
+    # General-binding targets have no configured catalytic residue; -1 prevents a
+    # coincidental residue 302 from being reported as a catalytic attack.
+    interaction_cat_num = cat_num if config["receptor"].get("catalytic_residue") else -1
+    refinement_cat_num = cat_num if config["receptor"].get("catalytic_residue") else None
     template = config["receptor"].get("template_pdb")
     template_path = resolve_path(root, template) if template else None
     cleaned, receptor_pdbqt = prepare_receptor(
@@ -504,16 +508,28 @@ def run(
     )
     append_run_history(root, json.loads((root / "reports" / "run_manifest.json").read_text(encoding="utf-8")))
     if not skip_vina:
-        # Each docking run starts from an empty result table; previous summaries
-        # are archived instead of being silently merged across receptors/boxes.
-        archive_dir = root / "reports" / "archive"
+        # Each docking run starts from an empty result set; previous summaries and
+        # per-ligand artifacts are archived instead of being silently merged with
+        # a different receptor/ligand set.
+        archive_dir = root / "reports" / "archive" / run_id
         for summary_name in ("docking_summary.csv", "consensus_summary.csv", "multi_box_results.csv", "ensemble_consensus.csv"):
             existing_summary = root / "reports" / summary_name
             if existing_summary.is_file():
                 archive_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(existing_summary, archive_dir / f"{existing_summary.stem}_{run_id}.csv")
+                shutil.copyfile(existing_summary, archive_dir / summary_name)
                 existing_summary.unlink()
                 LOGGER.info("Archived previous %s to %s", summary_name, archive_dir)
+        for dir_name in ("active_poses", "interactions", "figures", "ensemble", "multi_box", "replicates", "polysaccharides", "variants"):
+            existing_dir = root / "reports" / dir_name
+            if existing_dir.is_dir() and any(existing_dir.iterdir()):
+                target_dir = archive_dir / dir_name
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(existing_dir, target_dir)
+                shutil.rmtree(existing_dir)
+                existing_dir.mkdir(parents=True, exist_ok=True)
+                LOGGER.info("Archived previous %s/ to %s", dir_name, target_dir)
     if gate["manual_review_ligands"] or gate["enzyme_review_flags"]:
         LOGGER.warning("Capability review required before biological interpretation.")
     if advanced.get("replicates", {}).get("count", 1) > 1:
@@ -717,7 +733,7 @@ def run(
             refinement_info = refine_active_pose_in_pocket(
                 Path(summary["active_pose"]),
                 refined_pose_path,
-                catalytic_resseq=cat_num,
+                catalytic_resseq=refinement_cat_num,
             )
         else:
             refinement_info = {"refined": False, "reason": "disabled_by_config"}
@@ -747,7 +763,7 @@ def run(
         interactions = analyze_interactions(
             Path(summary["active_pose"]),
             root / "reports" / "interactions" / f'{ligand["name"]}_interactions.csv',
-            cat_num,
+            interaction_cat_num,
             target_chain=config["receptor"]["chain_id"],
             max_catalytic_attack_A=float(config.get("thresholds", {}).get("d_nuc_max", 4.5)),
             max_hydride_transfer_A=float(config.get("thresholds", {}).get("d_hyd_max", 5.0)),
@@ -811,6 +827,7 @@ def run(
     if multi_box_rows:
         aggregate_multi_box_results(multi_box_rows, root / "reports" / "multi_box_results.csv")
 
+    ensemble_ca_rmsds: list[float] = []
     if not skip_vina and advanced.get("receptor_ensemble", {}).get("enabled"):
         ensemble_seed = resolve_replicate_seeds(1, advanced.get("replicates", {}).get("seeds", []))[0]
         for ens_idx, ens_input in enumerate(advanced.get("receptor_ensemble", {}).get("inputs", []), start=2):
@@ -836,6 +853,7 @@ def run(
                 mobile_chain=config["receptor"]["chain_id"],
                 reference_chain=config["receptor"]["chain_id"],
             )
+            ensemble_ca_rmsds.append(float(kabsch_info["ca_rmsd_A"]))
             LOGGER.info("Superimposed ensemble receptor %s onto primary frame (CA RMSD=%.3f A)", ens_stem, kabsch_info["ca_rmsd_A"])
             ens_box = locate_mechanism_box(ens_cleaned, config)
             for ligand in config["ligands"]:
@@ -868,7 +886,7 @@ def run(
                 ens_refined = ens_rep_dir / "active_poses" / f"{ligand['name']}_refined.pdb"
                 ens_refinement_cfg = advanced.get("pose_refinement", {})
                 if ens_refinement_cfg.get("enabled", True):
-                    ens_ref_info = refine_active_pose_in_pocket(Path(ens_sum["active_pose"]), ens_refined, catalytic_resseq=cat_num)
+                    ens_ref_info = refine_active_pose_in_pocket(Path(ens_sum["active_pose"]), ens_refined, catalytic_resseq=refinement_cat_num)
                 else:
                     ens_ref_info = {"refined": False, "reason": "disabled_by_config"}
                 if (
@@ -881,7 +899,7 @@ def run(
                 ens_inter = analyze_interactions(
                     Path(ens_sum["active_pose"]),
                     ens_rep_dir / "interactions" / f"{ligand['name']}_interactions.csv",
-                    cat_num,
+                    interaction_cat_num,
                     target_chain=config["receptor"]["chain_id"],
                     max_catalytic_attack_A=float(config.get("thresholds", {}).get("d_nuc_max", 4.5)),
                     max_hydride_transfer_A=float(config.get("thresholds", {}).get("d_hyd_max", 5.0)),
@@ -889,7 +907,17 @@ def run(
                 update_interaction_summary(ens_rep_dir / "docking_summary.csv", ligand["name"], ens_inter)
                 ensemble_rows.append(dict(ens_sum))
         if len(ensemble_rows) > len(config["ligands"]):
-            aggregate_ensemble_results(ensemble_rows, root / "reports" / "ensemble_consensus.csv")
+            cross_target = any(rmsd > 3.0 for rmsd in ensemble_ca_rmsds)
+            if cross_target:
+                LOGGER.warning(
+                    "Receptor CA RMSD indicates unrelated targets; cross-receptor Boltzmann "
+                    "weighting is disabled (per-receptor results remain available)."
+                )
+            aggregate_ensemble_results(
+                ensemble_rows,
+                root / "reports" / "ensemble_consensus.csv",
+                cross_target=cross_target,
+            )
 
     cocrystal_pdb = receptor_out / "cocrystal_ligand.pdb"
     if not skip_vina and cocrystal_pdb.is_file():

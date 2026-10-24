@@ -69,6 +69,8 @@ def validate(root: Path) -> int:
         if row.get("Selection_Status") not in {
             "Catalytically_Competent",
             "Affinity_Fallback_No_Catalytic_Pose",
+            "Binding_Pose_Supported",
+            "Affinity_Fallback_No_Supported_Pose",
         }:
             raise ValueError(f"{ligand}: invalid Selection_Status")
         active = root / "reports" / "active_poses" / f"{ligand}_active.pdb"
@@ -145,11 +147,19 @@ def validate(root: Path) -> int:
     ):
         if not (root / "reports" / filename).is_file():
             raise FileNotFoundError(f"Missing system upgrade artifact: {filename}")
-    for item in config.get("ligands", []):
-        if item.get("name") and any(row.get("name") == item["name"] and row.get("sugar_like") for row in json.loads(compatibility.read_text(encoding="utf-8"))):
-            manifest = root / "data" / "04_prepped_ligands" / "polysaccharides" / f"{item['name']}__sugar_conformers.json"
-            if not manifest.is_file():
-                raise FileNotFoundError(f"Missing polysaccharide conformer manifest: {manifest}")
+    polysaccharide_enabled = bool(
+        config.get("advanced", {}).get("polysaccharide", {}).get("enabled", False)
+    )
+    if polysaccharide_enabled:
+        compatibility_rows = json.loads(compatibility.read_text(encoding="utf-8"))
+        for item in config.get("ligands", []):
+            if item.get("name") and any(
+                row.get("name") == item["name"] and row.get("sugar_like")
+                for row in compatibility_rows
+            ):
+                manifest = root / "data" / "04_prepped_ligands" / "polysaccharides" / f"{item['name']}__sugar_conformers.json"
+                if not manifest.is_file():
+                    raise FileNotFoundError(f"Missing polysaccharide conformer manifest: {manifest}")
     replicate_count = int(config.get("advanced", {}).get("replicates", {}).get("count", 1))
     if replicate_count > 1:
         consensus = root / "reports" / "consensus_summary.csv"

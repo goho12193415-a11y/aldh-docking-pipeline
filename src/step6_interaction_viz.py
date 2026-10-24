@@ -397,6 +397,25 @@ def generate_pymol_script(
     pse_path = pse.resolve()
     png_path = png.resolve()
     chain_clause = f"chain {target_chain} and " if target_chain else ""
+
+    def _residue_block(selection: str, resi: str, color: str) -> str:
+        if resi == "none":
+            return ""
+        return (
+            f"select {selection}, {chain_clause}polymer.protein and resi {resi}\n"
+            f"show sticks, {selection}\ncolor {color}, {selection}\n"
+        )
+
+    cat_block = _residue_block("cat_cys", cat_resi, "magenta")
+    hbond_block = _residue_block("hbond_residues", hbond_resi, "slate")
+    hydro_block = _residue_block("hydro_residues", hydro_resi, "smudge")
+    if hydro_block:
+        hydro_block += (
+            "create hydro_pocket_surf, hydro_residues\n"
+            "show surface, hydro_pocket_surf\n"
+            "set transparency, 72, hydro_pocket_surf\n"
+        )
+    focus_selection = "(ligand or cat_cys)" if cat_resi != "none" else "ligand"
     script.write_text(
         f'''reinitialize
 load "{complex_path.as_posix()}", complex
@@ -412,19 +431,7 @@ color cyan, ligand and elem C
 select cofactor, resn NAD+NAP+NDP
 show sticks, cofactor
 color tv_yellow, cofactor
-select cat_cys, {chain_clause}resn CYS+SER and resi {cat_resi}
-show sticks, cat_cys
-color magenta, cat_cys
-select hbond_residues, {chain_clause}polymer.protein and resi {hbond_resi}
-show sticks, hbond_residues
-color slate, hbond_residues
-select hydro_residues, {chain_clause}polymer.protein and resi {hydro_resi}
-show sticks, hydro_residues
-color smudge, hydro_residues
-create hydro_pocket_surf, hydro_residues
-show surface, hydro_pocket_surf
-set transparency, 72, hydro_pocket_surf
-''',
+{cat_block}{hbond_block}{hydro_block}''',
         encoding="utf-8",
     )
     with script.open("a", encoding="utf-8") as handle:
@@ -438,7 +445,7 @@ set transparency, 72, hydro_pocket_surf
                     f'color {color}, d{index}\n'
                 )
         handle.write(
-            f"orient ligand\nzoom (ligand or cat_cys), 5.0\nclip slab, 18\n"
+            f"orient ligand\nzoom {focus_selection}, 5.0\nclip slab, 18\n"
             f"save {pse_path.as_posix()}\nray {png_width}, {png_height}\npng {png_path.as_posix()}, dpi=300\nquit\n"
         )
     try:

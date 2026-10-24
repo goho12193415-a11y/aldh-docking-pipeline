@@ -1172,13 +1172,16 @@ ATOM 6 S SG . CYS A 302 4.750 1.100 1.900 1.00 15.00 1
         self.assertGreater(admet["QED_DrugLikeness_Score"], 0.4)
 
     def test_visual_html_report_generates_chinese_scorecard_and_3d_viewer_json(self):
+        import pandas as pd
         project_root = Path(__file__).resolve().parents[1]
+        summary = pd.read_csv(project_root / "reports" / "docking_summary.csv")
+        first_ligand = str(summary.iloc[0]["Ligand"])
         html_path = generate_visual_html_report(project_root)
         self.assertTrue(html_path.is_file())
         html_text = html_path.read_text(encoding="utf-8")
         self.assertIn("const POSES =", html_text)
         self.assertIn("Lipinski", html_text)
-        self.assertIn("Hexanal", html_text)
+        self.assertIn(first_ligand, html_text)
 
     def test_pipeline_generates_admet_csv_and_receptor_column_in_docking_summary(self):
         import pandas as pd

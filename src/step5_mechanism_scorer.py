@@ -463,6 +463,10 @@ def score_docking(
     # The hydride-transfer criterion is never relaxed: a pose with the cofactor
     # out of its productive conformation is reported as such, not as competent.
     effective_d_hyd_max = d_hyd_max
+    competence_basis = {
+        "aldh": "nucleophile_and_hydride_geometry",
+        "general_binding": "physchem_and_pocket_contact",
+    }.get(family, "mechanism_geometry")
 
     rows = []
     for mode_index, (model, flex_model) in enumerate(parsed_pairs, start=1):
@@ -533,6 +537,7 @@ def score_docking(
             "Nucleophile_Competent": bool(nuc_ok),
             "Hydride_Transfer_Competent": hyd_ok,
             "Catalytic_Geometry_Score": geom_score,
+            "Competence_Basis": competence_basis,
             "Catalytically_Competent": competent_flag,
         }
         rows.append((row, model, flex_model))
@@ -564,24 +569,32 @@ def score_docking(
     best_row["Top_Affinity_kcal_mol"] = top_row["Binding_Affinity_kcal_mol"]
     best_row["Parsed_Mode_Count"] = len(rows)
     best_row["Catalytically_Competent_Mode_Count"] = len(competent)
-    best_row["Selection_Status"] = (
-        "Catalytically_Competent"
-        if competent
-        else "Affinity_Fallback_No_Catalytic_Pose"
-    )
+    if family == "general_binding":
+        best_row["Selection_Status"] = (
+            "Binding_Pose_Supported" if competent else "Affinity_Fallback_No_Supported_Pose"
+        )
+    else:
+        best_row["Selection_Status"] = (
+            "Catalytically_Competent"
+            if competent
+            else "Affinity_Fallback_No_Catalytic_Pose"
+        )
     best_row["Best_Catalytic_Mode"] = best_row["Mode"] if competent else ""
     best_row["Best_Catalytic_kcal_mol"] = (
         best_row["Binding_Affinity_kcal_mol"] if competent else ""
     )
     if competent:
-        oxy_ok = (best_row.get("d_oxy_asn_A") != "" and float(best_row["d_oxy_asn_A"]) <= 4.2) or (
-            best_row.get("d_oxy_cysN_A") != "" and float(best_row["d_oxy_cysN_A"]) <= 4.2
-        )
-        best_row["Reliability_Grade"] = (
-            "A_High_Confidence_Catalytic"
-            if (best_row["d_nuc_A"] <= 3.8 and (oxy_ok or best_row["Cofactor_Conformation"] == "productive_hydride_in" or family != "aldh"))
-            else "B_Moderate_Confidence_Catalytic"
-        )
+        if family == "general_binding":
+            best_row["Reliability_Grade"] = "A_PhysChem_Supported_Pose"
+        else:
+            oxy_ok = (best_row.get("d_oxy_asn_A") != "" and float(best_row["d_oxy_asn_A"]) <= 4.2) or (
+                best_row.get("d_oxy_cysN_A") != "" and float(best_row["d_oxy_cysN_A"]) <= 4.2
+            )
+            best_row["Reliability_Grade"] = (
+                "A_High_Confidence_Catalytic"
+                if (best_row["d_nuc_A"] <= 3.8 and (oxy_ok or best_row["Cofactor_Conformation"] == "productive_hydride_in" or family != "aldh"))
+                else "B_Moderate_Confidence_Catalytic"
+            )
     else:
         best_row["Reliability_Grade"] = "C_Low_Confidence_Affinity_Fallback"
 

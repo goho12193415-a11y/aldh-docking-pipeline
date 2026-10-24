@@ -87,7 +87,9 @@ python main.py --config config/pipeline_config.yaml
 python scripts/validate_outputs.py
 ```
 
-`Catalytically_Competent=True` 要求亲核进攻距离合格，并且在受体保留 NAD/NADP 时同时满足羰基碳到 `C4N/C4` 的氢负离子转移距离阈值。氢负转移阈值是固定值，不会因为辅因子处于 “out” 构象而自动放宽；`Cofactor_Conformation=contracted_hydrolysis_out` 只作为诊断记录，这类构象不会被标成高置信度催化构象。结果表同时给出 `Nucleophile_Competent`、`Hydride_Transfer_Competent` 和 `d_sg_c4n_A`，便于逐项核对。如果没有任何 mode 同时满足，管道会写入 `Selection_Status=Affinity_Fallback_No_Catalytic_Pose`；此时导出的结构只能作为最低结合能参考构象，不能称为催化活性构象。
+`Catalytically_Competent=True` 要求亲核进攻距离合格，并且在受体保留 NAD/NADP 时同时满足羰基碳到 `C4N/C4` 的氢负离子转移距离阈值。氢负转移阈值是固定值，不会因为辅因子处于 “out” 构象而自动放宽；`Cofactor_Conformation=contracted_hydrolysis_out` 只作为诊断记录，这类构象不会被标成高置信度催化构象。结果表同时给出 `Nucleophile_Competent`、`Hydride_Transfer_Competent`、`Competence_Basis` 和 `d_sg_c4n_A`，便于逐项核对。如果没有任何 mode 同时满足，管道会写入 `Selection_Status=Affinity_Fallback_No_Catalytic_Pose`；此时导出的结构只能作为最低结合能参考构象，不能称为催化活性构象。
+
+对于 `general_binding`（无先验位点的通用靶点），合格性由物理化学打分与口袋接触决定，`Selection_Status` 使用 `Binding_Pose_Supported` 或 `Affinity_Fallback_No_Supported_Pose`，可靠性等级为 `A_PhysChem_Supported_Pose`，不再使用“催化”措辞。多受体运行如果 CA RMSD 表明受体是不同靶点，`ensemble_consensus.csv` 会标注 `Comparison_Status=cross_target_screening_only_not_physically_comparable`，并跳过跨受体的 Boltzmann 自由能加权，只保留每个受体各自的排名。
 
 输出位于 `reports/`：
 

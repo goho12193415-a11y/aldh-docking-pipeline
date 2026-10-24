@@ -609,7 +609,7 @@ class DockingWorkbench(tk.Tk):
             "d_hyd_A": "d_hyd(Å)",
             "d_oxy_asn_A": "d_oxy(Å)",
             "Catalytic_Geometry_Score": "几何总分",
-            "Catalytically_Competent": "催化合格",
+            "Catalytically_Competent": "机制合格",
             "Reliability_Grade": "可靠性等级",
         }
         for col in columns:

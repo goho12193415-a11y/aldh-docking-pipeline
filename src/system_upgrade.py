@@ -103,8 +103,19 @@ def aggregate_multi_box_results(box_rows: list[dict], output_csv: Path) -> list[
     return box_rows
 
 
-def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path, temperature_k: float = 298.15) -> list[dict]:
-    """Aggregate receptor ensemble runs using per-receptor rank, catalytic competence fraction, and statistical-mechanical Boltzmann-weighted free energy."""
+def aggregate_ensemble_results(
+    ensemble_rows: list[dict],
+    output_csv: Path,
+    temperature_k: float = 298.15,
+    cross_target: bool = False,
+) -> list[dict]:
+    """Aggregate receptor ensemble runs.
+
+    Boltzmann weighting is only physically meaningful for homologous structures of
+    the same target.  When ``cross_target`` is true (e.g. unrelated AlphaFold
+    models), per-receptor results are retained but the combined free energy is
+    left blank and the comparison is labelled as screening-only.
+    """
     if not ensemble_rows:
         return []
     rt_kcal = 0.001987204 * float(temperature_k)
@@ -139,7 +150,7 @@ def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path, temp
         boltzmann_dg = ""
         dominant_rec = ""
         dominant_weight = ""
-        if affinities:
+        if affinities and not cross_target:
             e_min = min(affinities)
             unnorm_weights = [math.exp(-(e_val - e_min) / rt_kcal) for e_val in affinities]
             z_sum = sum(unnorm_weights)
@@ -161,6 +172,10 @@ def aggregate_ensemble_results(ensemble_rows: list[dict], output_csv: Path, temp
             "Boltzmann_Dominant_Weight": dominant_weight,
             "Min_Affinity_kcal_mol": round(min(affinities), 3) if affinities else "",
             "Max_Affinity_kcal_mol": round(max(affinities), 3) if affinities else "",
+            "Comparison_Status": (
+                "cross_target_screening_only_not_physically_comparable"
+                if cross_target else "homologous_ensemble"
+            ),
         })
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -542,7 +557,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
           <h2>最优结合构象：<span class="ink-underline">{top_lig}</span> <small>（受体：{top_rec}）</small></h2>
           <p>
             经口袋几何尺规与热力学联测，<strong>{top_lig}</strong> 在活性腔内呈现最稳固的近进攻构象（Near-Attack Conformation）。
-            其结合自由能估值为 <strong>{top_aff} kcal/mol</strong>，反应碳原子距催化残基亲核中心 <strong>{top_dnuc} Å</strong>，
+            其结合自由能估值为 <strong>{top_aff} kcal/mol</strong>，反应原子距口袋关键中心 <strong>{top_dnuc} Å</strong>，
             并与周围残基（<strong>{top_hb}</strong>）形成稳定的非共价锚定网络。
           </p>
         </section>
@@ -554,12 +569,12 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     for idx, r in enumerate(ordered_rows, 1):
         grade = str(r.get("Reliability_Grade", ""))
         if grade.startswith("A_"):
-            seal_cls, seal_txt = "seal-a", "甲等 · 催化合拍"
+            seal_cls, seal_txt = "seal-a", "甲等 · 构象支持"
         elif grade.startswith("B_"):
             seal_cls, seal_txt = "seal-b", "乙等 · 构象可用"
         else:
             seal_cls, seal_txt = "seal-c", "丙等 · 寻常结合"
-        comp_txt = "合拍 (True)" if str(r.get("Catalytically_Competent")) == "True" else "偏离 (False)"
+        comp_txt = "支持 (True)" if str(r.get("Catalytically_Competent")) == "True" else "未支持 (False)"
         score_trs.append(f"""
         <tr>
           <td class="num-col">{idx:02d}</td>

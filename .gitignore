@@ -10,6 +10,11 @@ reports/*.json
 reports/*.sqlite3
 reports/archive/
 reports/active_poses/*
+reports/ensemble/
+reports/multi_box/
+reports/replicates/
+reports/variants/
+reports/polysaccharides/
 reports/interactions/*
 reports/figures/*
 reports/*.html
