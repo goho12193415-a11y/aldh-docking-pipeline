@@ -70,11 +70,11 @@ def _canvas_sketch_box(
 
 
 class Interactive3DPocketWindow(tk.Toplevel):
-    """Hand-drawn parchment-and-ink 3D molecular active-site sketchbook viewer (钢笔淡彩 / 炭铅素描三维速写台)."""
+    """Interactive 3D active-site viewer with element coloring and optional pocket/box overlays."""
 
     def __init__(self, master: tk.Misc, complex_pdb: Path, box_audit_json: Path | None, catalytic_num: int = 302) -> None:
         super().__init__(master)
-        self.title(f"活性口袋三维钢笔速写稿 — {complex_pdb.name}")
+        self.title(f"活性口袋三维视图 — {complex_pdb.name}")
         self.geometry("960x720")
         self.configure(bg="#F4EFE0")
 
@@ -146,15 +146,15 @@ class Interactive3DPocketWindow(tk.Toplevel):
         bar.pack(fill="x")
         tk.Label(
             bar,
-            text="按住左键旋转速写视角 · 滚轮缩放  |  靛蓝: 配体(LIG)   朱砂: 催化残基   赭石: 辅因子/金属   炭铅: 口袋骨架",
+            text="左键拖动旋转 · 滚轮缩放  |  蓝色: 配体   红色: 催化残基   橙色: 辅因子/金属   灰色: 口袋残基",
             bg="#EAE1CD",
             fg="#2B2520",
             font=("Georgia", 10, "bold"),
         ).pack(side="left")
-        tk.Button(bar, text="归位视角", command=self._reset_view, bg="#FBF8F1", fg="#2B2520", relief="solid", bd=1, padx=10).pack(side="right", padx=4)
-        tk.Checkbutton(bar, text="淡彩上色", variable=self.wash_mode_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
-        tk.Checkbutton(bar, text="尺规 Box", variable=self.show_box_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
-        tk.Checkbutton(bar, text="距离批注", variable=self.show_hbonds_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Button(bar, text="重置视角", command=self._reset_view, bg="#FBF8F1", fg="#2B2520", relief="solid", bd=1, padx=10).pack(side="right", padx=4)
+        tk.Checkbutton(bar, text="按元素着色", variable=self.wash_mode_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Checkbutton(bar, text="显示 Box", variable=self.show_box_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Checkbutton(bar, text="显示距离", variable=self.show_hbonds_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
         tk.Checkbutton(bar, text="口袋残基", variable=self.show_pocket_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
 
     def _reset_view(self) -> None:
@@ -209,7 +209,7 @@ class Interactive3DPocketWindow(tk.Toplevel):
         _canvas_sketch_line(self.canvas, w - 14, 14, w - 14, h - 14, "#2B2520", 2, 2)
         _canvas_sketch_line(self.canvas, w - 14, h - 14, 14, h - 14, "#2B2520", 2, 3)
         _canvas_sketch_line(self.canvas, 14, h - 14, 14, 14, "#2B2520", 2, 4)
-        self.canvas.create_text(26, h - 26, text="Plate I — 活性口袋三维钢笔淡彩速写", anchor="w", fill="#655B4E", font=("Georgia", 10, "italic"))
+        self.canvas.create_text(26, h - 26, text="活性口袋三维视图", anchor="w", fill="#655B4E", font=("Georgia", 10, "italic"))
 
         if self.show_box_var.get() and self.box_info:
             bx, by, bz = self.box_info.get("center_x", 0.0), self.box_info.get("center_y", 0.0), self.box_info.get("center_z", 0.0)
@@ -313,7 +313,7 @@ class DockingWorkbench(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("分子对接与催化构象实验手札 · 手绘工作台")
+        self.title("分子对接工作台")
         self.geometry("1260x820")
         self.minsize(1040, 680)
         self.process: subprocess.Popen[str] | None = None
@@ -395,12 +395,12 @@ class DockingWorkbench(tk.Tk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         tk.Label(sidebar, text="FOLIO", bg=self.COLORS["navy"], fg=self.COLORS["white"], font=("Georgia", 20, "bold")).pack(anchor="w", padx=24, pady=(26, 0))
-        tk.Label(sidebar, text="纸本钢笔淡彩 · 实验手札台", bg=self.COLORS["navy"], fg="#C9BFA8", font=("Georgia", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
+        tk.Label(sidebar, text="AutoDock Vina 对接流程", bg=self.COLORS["navy"], fg="#C9BFA8", font=("Georgia", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
         nav_items = [
-            ("quick", "卷一 · 标本入册"),
-            ("prep", "卷二 · 活性尺规"),
-            ("dock", "卷三 · 构象搜寻"),
-            ("results", "卷四 · 台账与速写"),
+            ("quick", "快速实验"),
+            ("prep", "受体与位点"),
+            ("dock", "对接参数"),
+            ("results", "结果与导出"),
         ]
         for key, label in nav_items:
             frame = tk.Frame(sidebar, bg=self.COLORS["navy"], padx=18, pady=11, cursor="hand2")
@@ -415,7 +415,7 @@ class DockingWorkbench(tk.Tk):
         tk.Frame(sidebar, bg="#5C5042", height=1).pack(fill="x", padx=24, pady=22)
         tk.Label(sidebar, text="当前项目目录", bg=self.COLORS["navy"], fg="#C9BFA8", font=("Georgia", 8, "bold")).pack(anchor="w", padx=24)
         tk.Label(sidebar, textvariable=self.root_var, wraplength=180, justify="left", bg=self.COLORS["navy"], fg="#F6F1E4", font=("Georgia", 8)).pack(anchor="w", padx=24, pady=(6, 0))
-        tk.Label(sidebar, text="9大机制 / 3D-pKa / 物理重打分已启用", bg=self.COLORS["navy"], fg="#D8B372", font=("Georgia", 8)).pack(anchor="w", padx=24, pady=(18, 0))
+        tk.Label(sidebar, text="9 类机制 · 3D-pKa · 物理重打分", bg=self.COLORS["navy"], fg="#D8B372", font=("Georgia", 8)).pack(anchor="w", padx=24, pady=(18, 0))
 
     def _build_main(self) -> None:
         main = ttk.Frame(self, padding=(24, 20, 24, 16))
@@ -426,8 +426,8 @@ class DockingWorkbench(tk.Tk):
         header = ttk.Frame(main)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="分子对接与催化构象实验手札", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="覆盖 9 大酶与通用靶点家族、3D 微环境 pKa、侧链自动修复、物理化学能量重打分、L-BFGS-B 精修与交互式 3D 视图。", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(header, text="分子对接工作台", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="支持 9 类机制模板和通用靶点；包含受体清理、口袋定位、Vina 对接、物理化学重打分、局部精修和三维查看。", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
         btn_bar = ttk.Frame(header)
         btn_bar.grid(row=0, column=1, rowspan=2)
         ttk.Button(btn_bar, text="停止任务", style="Danger.TButton", command=self._stop_worker).pack(side="left", padx=(0, 8))
@@ -479,7 +479,7 @@ class DockingWorkbench(tk.Tk):
         log_frame = ttk.Frame(split_bottom, style="Card.TFrame", padding=10)
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
-        ttk.Label(log_frame, text="实验过程笔录", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(log_frame, text="运行日志", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.log = tk.Text(log_frame, wrap="none", state="disabled", bg="#FAF5E8", fg="#2B2520", insertbackground="#2B2520", relief="flat", padx=12, pady=8, height=10, font=("Consolas", 9))
         self.log.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
@@ -491,9 +491,9 @@ class DockingWorkbench(tk.Tk):
         live_3d_frame.columnconfigure(0, weight=1)
         live_hdr = ttk.Frame(live_3d_frame, style="Card.TFrame")
         live_hdr.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self.live_3d_title_var = tk.StringVar(value="实时三维构象演进速写窗（运行或选定标本时自动推演）")
+        self.live_3d_title_var = tk.StringVar(value="实时构象预览（运行中自动刷新）")
         ttk.Label(live_hdr, textvariable=self.live_3d_title_var, style="Section.TLabel").pack(side="left")
-        ttk.Button(live_hdr, text="▶ 回放构象搜寻", style="Secondary.TButton", command=self._replay_live_trajectory).pack(side="right")
+        ttk.Button(live_hdr, text="▶ 回放构象", style="Secondary.TButton", command=self._replay_live_trajectory).pack(side="right")
         self.live_canvas = tk.Canvas(live_3d_frame, bg="#F4EFE0", height=210, width=440, highlightthickness=1, highlightbackground="#2B2520", cursor="fleur")
         self.live_canvas.grid(row=1, column=0, sticky="nsew")
         self.live_yaw = 0.45
@@ -519,8 +519,8 @@ class DockingWorkbench(tk.Tk):
     def _build_page_quick(self) -> None:
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         page.columnconfigure(1, weight=1)
-        ttk.Label(page, text="卷一 · 标本入册（放入蛋白与配体标本）", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(page, text="支持同时选择多个受体 PDB，配体支持直接导入 .mol2 / .sdf 三维结构文件、CSV/SMI 表格或 名称=SMILES。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 12))
+        ttk.Label(page, text="快速实验", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(page, text="可同时选择多个受体 PDB；配体支持 .mol2/.sdf 文件、CSV/SMI 列表或 名称=SMILES。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 12))
         ttk.Label(page, text="受体 PDB", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Entry(page, textvariable=self.quick_receptor_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=10)
         ttk.Button(page, text="浏览 PDB(可多选)", style="Secondary.TButton", command=self._choose_quick_receptor).grid(row=2, column=3)
@@ -535,8 +535,8 @@ class DockingWorkbench(tk.Tk):
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         for col in range(6):
             page.columnconfigure(col, weight=1)
-        ttk.Label(page, text="卷二 · 活性尺规（位点勘定与质子化微态）", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
-        ttk.Label(page, text="支持 9 类酶与通用靶点机制，自动重建缺失侧链重原子、清理 AltLoc、探测桥联结晶水并预测口袋 3D 微环境 pKa。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
+        ttk.Label(page, text="受体与位点", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(page, text="支持 9 类机制模板和通用靶点；可补全缺失侧链、处理 AltLoc、保留桥联水并估算口袋 pKa。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
 
         ttk.Label(page, text="机制家族", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         mech_box = ttk.Combobox(page, textvariable=self.mechanism_var, values=list_supported_mechanisms(), state="readonly", width=18)
@@ -564,10 +564,10 @@ class DockingWorkbench(tk.Tk):
 
         btn_row = ttk.Frame(page, style="Card.TFrame")
         btn_row.grid(row=4, column=0, columnspan=6, sticky="w", pady=(12, 0))
-        ttk.Checkbutton(btn_row, text="自动去盐与微态枚举", variable=self.auto_chem_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(btn_row, text="自动识别催化位点", variable=self.auto_cys_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(btn_row, text="自动探测并保留活性位点桥联水", variable=self.bridging_water_var).pack(side="left", padx=(0, 12))
-        ttk.Button(btn_row, text="从当前 PDB 自动探测位点", style="Secondary.TButton", command=self._auto_detect_from_pdb).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(btn_row, text="自动去盐/质子化状态", variable=self.auto_chem_var).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(btn_row, text="自动识别催化残基", variable=self.auto_cys_var).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(btn_row, text="保留活性位点桥联水", variable=self.bridging_water_var).pack(side="left", padx=(0, 12))
+        ttk.Button(btn_row, text="从 PDB 识别位点", style="Secondary.TButton", command=self._auto_detect_from_pdb).pack(side="left", padx=(0, 8))
         ttk.Button(btn_row, text="保存到配置文件", style="Primary.TButton", command=self._save_vars_to_config).pack(side="left")
         self.pages["prep"] = page
 
@@ -575,8 +575,8 @@ class DockingWorkbench(tk.Tk):
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         for col in range(6):
             page.columnconfigure(col, weight=1)
-        ttk.Label(page, text="卷三 · 构象搜寻（活性腔体尺规与采样精度）", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
-        ttk.Label(page, text="支持已知位点聚焦与无先验全蛋白 3D 空腔扫描（盲对接），内置物理化学能量重打分与 L-BFGS-B 局部精修。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
+        ttk.Label(page, text="对接参数", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(page, text="支持指定位点或全蛋白盲对接；内置物理化学重打分和局部精修。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
 
         ttk.Label(page, text="Box 尺寸 X/Y/Z (Å)", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         box_frame = ttk.Frame(page, style="Card.TFrame")
@@ -611,13 +611,13 @@ class DockingWorkbench(tk.Tk):
         header_row = ttk.Frame(page, style="Card.TFrame")
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header_row.columnconfigure(0, weight=1)
-        ttk.Label(header_row, text="卷四 · 实验台账与三维钢笔速写", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header_row, text="结果与导出", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         btn_box = ttk.Frame(header_row, style="Card.TFrame")
         btn_box.grid(row=0, column=1, sticky="e")
-        ttk.Button(btn_box, text="展阅手绘实验手札(HTML)", style="Primary.TButton", command=self._open_html_report).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_box, text="开启三维钢笔速写台", style="Secondary.TButton", command=self._open_interactive_3d_viewer).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_box, text="预览 300DPI 渲染图", style="Secondary.TButton", command=self._preview_selected_figure).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_box, text="查看 14 项系统覆盖矩阵", style="Secondary.TButton", command=self._show_coverage_dialog).pack(side="left")
+        ttk.Button(btn_box, text="打开结果报告 (HTML)", style="Primary.TButton", command=self._open_html_report).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_box, text="打开三维查看器", style="Secondary.TButton", command=self._open_interactive_3d_viewer).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_box, text="预览 300 DPI 图片", style="Secondary.TButton", command=self._preview_selected_figure).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_box, text="查看系统覆盖矩阵", style="Secondary.TButton", command=self._show_coverage_dialog).pack(side="left")
 
         columns = (
             "Receptor", "Ligand", "Mode", "Binding_Affinity_kcal_mol", "PhysChem_Score_kcal_mol",
@@ -710,7 +710,7 @@ class DockingWorkbench(tk.Tk):
             }]
         self.live_frames = frames
         self.live_frame_idx = 0
-        self.live_3d_title_var.set(f"实时三维构象速写：{lig_name} (共 {len(frames)} 帧演进)")
+        self.live_3d_title_var.set(f"实时构象预览：{lig_name}（{len(frames)} 帧）")
         self._draw_live_canvas()
 
     def _tick_live_canvas(self) -> None:
@@ -733,7 +733,7 @@ class DockingWorkbench(tk.Tk):
         for gy in range(24, h, 24):
             c.create_line(0, gy, w, gy, fill="#E5DEC9", width=1)
         if not self.live_frames:
-            c.create_text(w * 0.5, h * 0.5, text="等待构象数据流...", fill="#655B4E", font=("Georgia", 10, "italic"))
+            c.create_text(w * 0.5, h * 0.5, text="等待构象数据...", fill="#655B4E", font=("Georgia", 10, "italic"))
             return
         frame = self.live_frames[self.live_frame_idx % len(self.live_frames)]
         lig_pts = frame.get("lig", [])
@@ -1129,7 +1129,7 @@ class DockingWorkbench(tk.Tk):
                 with summary_csv.open(newline="", encoding="utf-8") as handle:
                     rows = list(csv.DictReader(handle))
                 competent = sum(row.get("Catalytically_Competent") == "True" for row in rows)
-                self.result_var.set(f"共 {len(rows)} 个配体；催化合格 {competent}/{len(rows)}")
+                self.result_var.set(f"共 {len(rows)} 个配体；机制合格 {competent}/{len(rows)}")
                 if self.results_tree is not None:
                     for item in self.results_tree.get_children():
                         self.results_tree.delete(item)
@@ -1187,17 +1187,17 @@ class DockingWorkbench(tk.Tk):
             return
         data = json.loads(cov_path.read_text(encoding="utf-8"))
         top = tk.Toplevel(self)
-        top.title("14 项全流程自动化覆盖矩阵 (v3.0)")
+        top.title("系统覆盖矩阵")
         top.geometry("780x460")
         tree = ttk.Treeview(top, columns=("item", "status", "external"), show="headings")
         tree.heading("item", text="模块项")
         tree.heading("status", text="当前自动化状态")
-        tree.heading("external", text="内置执行状态")
+        tree.heading("external", text="执行状态")
         tree.column("item", width=190)
         tree.column("status", width=400)
         tree.column("external", width=140, anchor="center")
         for row in data.get("items", []):
-            tree.insert("", "end", values=(row.get("item"), row.get("status"), "已全内置闭环"))
+            tree.insert("", "end", values=(row.get("item"), row.get("status"), "外部验证" if row.get("external_validation_required") else "内置"))
         tree.pack(expand=True, fill="both", padx=12, pady=12)
 
     def _busy(self) -> bool:

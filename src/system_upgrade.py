@@ -509,7 +509,7 @@ def _extract_pose_json_for_viewer(pose_pdb: Path, catalytic_num: int = 302) -> d
             frames = []
     if not frames and lig:
         frames = [{
-            "frame_label": "最优锁定构象",
+            "frame_label": "最优构象",
             "mode": 1,
             "stage": "final",
             "is_best_selected": True,
@@ -579,32 +579,32 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
         top_hb = top_hit.get("HBond_Residues", "未检出明显氢键") or "未检出明显氢键"
         hero_html = f"""
         <section class="folio-note sketch-box">
-          <div class="stamp-seal">首选标本</div>
-          <div class="note-meta">实验批注 · 编号 01</div>
+          <div class="stamp-seal">对接结果</div>
+          <div class="note-meta">运行摘要</div>
           <h2>最优结合构象：<span class="ink-underline">{top_lig}</span> <small>（受体：{top_rec}）</small></h2>
           <p>
-            经口袋几何尺规与热力学联测，<strong>{top_lig}</strong> 在活性腔内呈现最稳固的近进攻构象（Near-Attack Conformation）。
-            其结合自由能估值为 <strong>{top_aff} kcal/mol</strong>，反应原子距口袋关键中心 <strong>{top_dnuc} Å</strong>，
-            并与周围残基（<strong>{top_hb}</strong>）形成稳定的非共价锚定网络。下方速写台正在实时推演其多构象搜寻与 L-BFGS-B 能量精修轨迹。
+            根据口袋几何和打分结果，<strong>{top_lig}</strong> 在预测口袋中给出较稳定的结合构象。
+            Vina 亲和力为 <strong>{top_aff} kcal/mol</strong>，关键原子距口袋中心 <strong>{top_dnuc} Å</strong>，
+            并与周围残基（<strong>{top_hb}</strong>）形成非共价相互作用。下方可回放多构象搜索和精修过程。
           </p>
         </section>
         """
     else:
-        hero_html = '<section class="folio-note sketch-box"><h2>尚无实验记录</h2></section>'
+        hero_html = '<section class="folio-note sketch-box"><h2>暂无对接结果</h2></section>'
 
     score_trs = []
     for idx, r in enumerate(ordered_rows, 1):
         grade = str(r.get("Reliability_Grade", ""))
         if grade.startswith("A_"):
-            seal_cls, seal_txt = "seal-a", "甲等 · 构象支持"
+            seal_cls, seal_txt = "seal-a", "A · 构象支持"
         elif grade.startswith("B_"):
-            seal_cls, seal_txt = "seal-b", "乙等 · 构象可用"
+            seal_cls, seal_txt = "seal-b", "B · 构象可用"
         else:
-            seal_cls, seal_txt = "seal-c", "丙等 · 寻常结合"
+            seal_cls, seal_txt = "seal-c", "C · 低可信"
         comp_txt = "支持 (True)" if str(r.get("Catalytically_Competent")) == "True" else "未支持 (False)"
         lig_k = f"{r.get('Receptor', 'primary')} · {r.get('Ligand', '')}" if len({x.get("Receptor", "") for x in ordered_rows}) > 1 else str(r.get("Ligand", ""))
         score_trs.append(f"""
-        <tr onclick="switchPose('{lig_k}')" style="cursor:pointer;" title="点击在上方三维速写台推演该分子构象">
+        <tr onclick="switchPose('{lig_k}')" style="cursor:pointer;" title="点击在上方查看该分子的构象">
           <td class="num-col">{idx:02d}</td>
           <td>{r.get("Receptor", "receptor")}</td>
           <td><strong class="lig-title">{r.get("Ligand", "")}</strong></td>
@@ -615,7 +615,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
           <td class="num-col">{r.get("d_nuc_A", "")}</td>
           <td class="num-col">{r.get("d_hyd_A", "")}</td>
           <td class="num-col">{r.get("Burgi_Dunitz_Angle_deg", "")}°</td>
-          <td class="num-col">{r.get("Bridged_Waters_Count", 0)} 桥 / {r.get("Displaced_Waters_Count", 0)} 排</td>
+          <td class="num-col">{r.get("Bridged_Waters_Count", 0)} 桥联 / {r.get("Displaced_Waters_Count", 0)} 排</td>
           <td>{r.get("HBond_Residues", "") or "—"}</td>
           <td>{r.get("Hydrophobic_Residues", "") or "—"}</td>
         </tr>
@@ -625,7 +625,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     for ar in admet_rows:
         lp_ok = str(ar.get("Lipinski_Rule_of_5_Pass")) == "True"
         seal_cls = "seal-a" if lp_ok else "seal-b"
-        seal_txt = "合乎五则" if lp_ok else "部分越界"
+        seal_txt = "符合类药规则" if lp_ok else "部分指标超限"
         admet_trs.append(f"""
         <tr>
           <td><strong class="lig-title">{ar.get("Ligand", "")}</strong></td>
@@ -648,7 +648,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>分子对接与构象手札 · 实时三维推演台</title>
+  <title>分子对接结果报告</title>
   <style>
     :root {{
       --paper: #F6F1E4;
@@ -770,29 +770,29 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 <body>
   <div class="folio-container">
     <header class="masthead">
-      <div class="sub-kicker">Live 3D Conformational Search &amp; Mechanistic Sketchbook</div>
-      <h1>分子对接与实时三维构象推演手札</h1>
-      <p>实时多构象搜寻轨迹动画 · L-BFGS-B 能量微调演进 · 活性口袋钢笔淡彩速写</p>
+      <div class="sub-kicker">Docking Result Report</div>
+      <h1>分子对接结果报告</h1>
+      <p>AutoDock Vina 结果汇总、构象查看与配体性质</p>
     </header>
 
     {hero_html}
 
     <section class="sketch-box">
       <div class="section-head">
-        <h3>卷一 · 活性口袋三维构象实时推演台（支持多构象搜寻动画回放与鼠标 360° 拖拽）</h3>
-        <span>Real-Time 3D Conformation Trajectory &amp; Sketchpad</span>
+        <h3>3D 构象查看（支持多构象回放与鼠标拖拽旋转）</h3>
+        <span>3D Conformation Viewer</span>
       </div>
       <div class="viewer-bar">
-        <label for="poseSelect"><strong>切换标本：</strong></label>
+        <label for="poseSelect"><strong>切换配体：</strong></label>
         <select id="poseSelect" onchange="switchPose(this.value)">{option_tags}</select>
-        <button id="playBtn" class="primary-ink" onclick="togglePlay()">⏸ 暂停实时构象推演</button>
-        <button onclick="stepFrame(-1)">◁ 上一构象帧</button>
-        <button onclick="stepFrame(1)">下一构象帧 ▷</button>
-        <button onclick="toggleStyle()">画风：钢笔淡彩 / 铅笔线稿</button>
-        <button onclick="resetCamera()">归位视角</button>
+        <button id="playBtn" class="primary-ink" onclick="togglePlay()">⏸ 暂停</button>
+        <button onclick="stepFrame(-1)">◁ 上一帧</button>
+        <button onclick="stepFrame(1)">下一帧 ▷</button>
+        <button onclick="toggleStyle()">显示：按元素 / 线框</button>
+        <button onclick="resetCamera()">重置视角</button>
       </div>
       <div class="timeline-bar">
-        <strong id="frameBadge" style="min-width:260px;color:var(--cinnabar);">正在推演：Mode 1</strong>
+        <strong id="frameBadge" style="min-width:260px;color:var(--cinnabar);">当前：Mode 1</strong>
         <input id="frameSlider" type="range" min="0" max="100" value="0" oninput="onSliderInput(this.value)" />
         <span id="telemetryText" style="font-size:13px;color:var(--ink);font-family:Georgia,serif;"></span>
       </div>
@@ -801,20 +801,20 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 
     <section class="sketch-box">
       <div class="section-head">
-        <h3>卷二 · 对接能量与催化几何评定台账（点击任意行可在上方实时推演该分子）</h3>
-        <span>Mechanistic &amp; Thermodynamic Ledger</span>
+        <h3>对接结果（点击任意行可在上方查看该分子）</h3>
+        <span>Docking Results</span>
       </div>
       <p class="guide-caption">
-        <strong>台账判读要领：</strong>凡标有 <strong>【甲等 · 催化合拍】</strong> 且 <strong>Vina 结合能负值更深（如 &lt; -6.0 kcal/mol）</strong> 者，即兼具强结合力与正确反应取向的优选分子。点击表格中任意一行，上方三维画布将立即切换并实时推演该分子的构象搜寻轨迹。
+        <strong>结果说明：</strong>可靠性为 A 且 Vina 打分更低的配体通常优先关注；最终结论仍需实验验证。点击表格行可在上方切换该分子的构象。
       </p>
       <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
-              <th>序号</th><th>受体蛋白</th><th>配体名称</th><th>评定印记</th>
-              <th>Vina 结合能 (kcal/mol)</th><th>物理重打分</th><th>反应取向</th>
+              <th>序号</th><th>受体蛋白</th><th>配体名称</th><th>可靠性</th>
+              <th>Vina 打分 (kcal/mol)</th><th>物理重打分</th><th>反应取向</th>
               <th>亲核距 d_nuc (Å)</th><th>氢转移距 d_hyd (Å)</th><th>进攻角 (°)</th>
-              <th>水桥 / 置换水</th><th>氢键锚定残基</th><th>疏水接触残基</th>
+              <th>水桥 / 置换水</th><th>氢键残基</th><th>疏水接触残基</th>
             </tr>
           </thead>
           <tbody>
@@ -826,8 +826,8 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 
     <section class="sketch-box">
       <div class="section-head">
-        <h3>卷三 · 配体物化性质与 Lipinski 成药五则</h3>
-        <span>Physicochemical &amp; Rule-of-Five Profile</span>
+        <h3>配体性质与 Lipinski 规则</h3>
+        <span>Ligand Properties</span>
       </div>
       <div style="overflow-x:auto;">
         <table>
@@ -835,7 +835,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
             <tr>
               <th>配体名称</th><th>分子量 MW (Da)</th><th>LogP</th><th>TPSA (Å²)</th>
               <th>氢键供体 HBD</th><th>氢键受体 HBA</th><th>可旋转键</th><th>QED 指数</th>
-              <th>五则印记</th><th>备注</th>
+              <th>类药性</th><th>备注</th>
             </tr>
           </thead>
           <tbody>
@@ -882,12 +882,12 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 
     function togglePlay() {{
       isPlaying = !isPlaying;
-      playBtn.textContent = isPlaying ? '⏸ 暂停实时构象推演' : '▶ 实时推演构象搜寻全过程';
+      playBtn.textContent = isPlaying ? '⏸ 暂停' : '▶ 播放构象搜索';
     }}
 
     function stepFrame(delta) {{
       isPlaying = false;
-      playBtn.textContent = '▶ 实时推演构象搜寻全过程';
+      playBtn.textContent = '▶ 播放构象搜索';
       const data = POSES[currentKey];
       const n = (data && data.frames && data.frames.length) ? data.frames.length : 1;
       animCursor = (Math.round(animCursor) + delta + n) % n;
@@ -897,7 +897,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 
     function onSliderInput(val) {{
       isPlaying = false;
-      playBtn.textContent = '▶ 实时推演构象搜寻全过程';
+      playBtn.textContent = '▶ 播放构象搜索';
       animCursor = parseFloat(val) / 100.0;
       draw();
     }}
@@ -1011,7 +1011,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       sketchLine(10, h - 10, 10, 10, '#2B2520', 1.4, 4);
       ctx.fillStyle = '#655B4E';
       ctx.font = 'italic 12px Georgia, serif';
-      ctx.fillText('Fig. I — 活性口袋三维构象实时搜寻与 L-BFGS-B 精修演进速写 (比例尺: 1 Å)', 22, h - 20);
+      ctx.fillText('Fig. I — 活性口袋构象搜索与精修过程（比例尺 1 Å）', 22, h - 20);
     }}
 
     function draw() {{
@@ -1028,7 +1028,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       frameBadge.textContent = `[帧 ${{state.frameIndex}}/${{state.totalFrames}}] ${{fInfo.frame_label || '构象采样'}}`;
       const vinaStr = fInfo.vina_kcal !== undefined && fInfo.vina_kcal !== '' ? `Vina: ${{fInfo.vina_kcal}} kcal/mol` : '';
       const dnucStr = fInfo.d_nuc_A !== undefined && fInfo.d_nuc_A !== '' ? ` | d_nuc: ${{fInfo.d_nuc_A}} Å` : '';
-      const angStr = fInfo.angle_deg !== undefined && fInfo.angle_deg !== '' ? ` | 进攻角: ${{fInfo.angle_deg}}°` : '';
+      const angStr = fInfo.angle_deg !== undefined && fInfo.angle_deg !== '' ? ` | Bürgi–Dunitz 角: ${{fInfo.angle_deg}}°` : '';
       telemetryText.textContent = vinaStr + dnucStr + angStr;
 
       drawSketchBonds(data.pocket || [], c, w, h, '#7A7062', 1.6, 1.9);
@@ -1114,13 +1114,13 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       sketchLine(20, 94, 20, 20, '#2B2520', 1.4, 14);
       ctx.fillStyle = '#2B2520';
       ctx.font = 'bold 13.5px "Songti SC", Georgia, serif';
-      ctx.fillText(`标本: ${{currentKey}} · ${{fInfo.frame_label || ''}}`, 30, 42);
+      ctx.fillText(`配体: ${{currentKey}} · ${{fInfo.frame_label || ''}}`, 30, 42);
       ctx.font = '12.5px Georgia, serif';
       ctx.fillStyle = '#655B4E';
       ctx.fillText(`Vina: ${{fInfo.vina_kcal || '-'}} kcal/mol  |  d_nuc: ${{minCatDist < 90 ? minCatDist.toFixed(2) : '-'}} Å`, 30, 63);
       ctx.fillStyle = fInfo.is_best_selected ? '#3D6349' : (fInfo.competent ? '#B57B28' : '#A8382B');
       ctx.font = 'bold 12px "Songti SC", serif';
-      ctx.fillText(fInfo.is_best_selected ? '印记：【最优催化构象 · 已锁定】' : (fInfo.competent ? '印记：【满足催化几何 · 候选】' : '印记：【构象空间搜寻采样中...】'), 30, 83);
+      ctx.fillText(fInfo.is_best_selected ? '状态：最优构象' : (fInfo.competent ? '状态：候选构象' : '状态：构象采样'), 30, 83);
     }}
 
     function tick() {{
