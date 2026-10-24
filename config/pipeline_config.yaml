@@ -16,6 +16,8 @@ vina:
 
 receptor:
   input_pdb: "data/01_raw_receptors/receptor.pdb"
+  input_pdbs: ["data/01_raw_receptors/receptor.pdb"]
+  auto_discover_receptors: true
   template_pdb: null
   chain_id: A
   cofactor_chain: A

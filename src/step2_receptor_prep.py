@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import FallbackAtom, PDBIO, PDBParser, Select, Superimposer, align_ca_residues, atom_dict, distance, require_executable
+from .common import FallbackAtom, PDBIO, PDBParser, Select, Superimposer, align_ca_residues, atom_dict, convert_cif_to_pdb, distance, require_executable
 
 LOGGER = logging.getLogger(__name__)
 COFACTORS = {"NAD", "NAP", "NDP", "FAD", "FMN", "HEM", "HEC", "HEA"}
@@ -45,7 +45,7 @@ class ReceptorSelect(Select):
         self.catalytic_coord = catalytic_coord
         self.keep_catalytic_metals = keep_catalytic_metals
         self.metal_cutoff_A = metal_cutoff_A
-        self._chosen_altlocs: dict[tuple[str, int, str], int] = {}
+        self._chosen_altlocs: dict[tuple[str, tuple, str], str] = {}
 
     def accept_chain(self, chain) -> int:
         return 1
@@ -75,14 +75,14 @@ class ReceptorSelect(Select):
         if residue is None:
             return 1
         chain_id = residue.get_parent().id if residue.get_parent() is not None else ""
-        key = (chain_id, int(residue.id[1]), atom.get_name().strip())
+        key = (chain_id, residue.id, atom.get_name().strip())
         if key not in self._chosen_altlocs:
-            disordered_children = getattr(atom, "child_dict", None)
-            candidates = (
-                list(disordered_children.values())
-                if disordered_children
-                else [a for a in residue if a.get_name().strip() == atom.get_name().strip()]
-            )
+            # PDBIO iterates the unpacked altloc children, so build candidates from
+            # get_unpacked_list() rather than the residue wrapper to keep identities comparable.
+            candidates = [
+                a for a in residue.get_unpacked_list()
+                if a.get_name().strip() == atom.get_name().strip()
+            ]
             candidates.sort(
                 key=lambda item: (
                     -float(item.get_occupancy() if item.get_occupancy() is not None else 0.0),
@@ -91,18 +91,8 @@ class ReceptorSelect(Select):
                 )
             )
             chosen = candidates[0]
-            self._chosen_altlocs[key] = id(chosen)
-            if disordered_children and hasattr(atom, "disordered_select"):
-                atom.disordered_select(chosen.get_altloc())
-            try:
-                chosen.set_altloc(" ")
-                chosen.set_occupancy(1.0)
-            except AttributeError:
-                pass
-        if id(atom) == self._chosen_altlocs[key] or (
-            getattr(atom, "child_dict", None)
-            and id(getattr(atom, "selected_child", None)) == self._chosen_altlocs[key]
-        ):
+            self._chosen_altlocs[key] = chosen.get_altloc() or " "
+        if (atom.get_altloc() or " ") == self._chosen_altlocs[key]:
             try:
                 atom.set_altloc(" ")
                 atom.set_occupancy(1.0)
@@ -757,6 +747,8 @@ def prepare_receptor(
     optimize_cofactor_in_state: bool = False,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if input_pdb.suffix.lower() in {".cif", ".mmcif"}:
+        input_pdb = convert_cif_to_pdb(input_pdb, output_dir / f"{input_pdb.stem}_from_cif.pdb")
     cleaned_pdb = output_dir / "receptor_cleaned.pdb"
     source_pdb = input_pdb
     if template_pdb:

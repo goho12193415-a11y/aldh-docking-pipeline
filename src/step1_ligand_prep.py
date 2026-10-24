@@ -13,6 +13,11 @@ from .common import (
     enumerate_ph_protonation_states,
     enumerate_stereoisomers_and_tautomers,
     generate_fallback_3d_coords,
+    parse_mol2_block,
+    parse_mol2_file,
+    parse_pdb_ligand_file,
+    parse_sdf_block,
+    parse_sdf_file,
     parse_smiles_tokens,
     standardize_and_desalt_smiles,
     write_fallback_pdbqt,
@@ -66,45 +71,106 @@ def enumerate_ligand_variants(
 
 
 def discover_raw_ligands(raw_ligands_dir: Path, configured_ligands: list[dict] | None = None) -> list[dict]:
-    """Automatically merge configured ligands with any .smi/.csv/.txt files in data/02_raw_ligands/."""
+    """Automatically merge configured ligands with any .mol2/.sdf/.mol/.pdb/.pdbqt/.smi/.csv/.txt files in data/02_raw_ligands/."""
     merged: list[dict] = []
     seen_names: set[str] = set()
     for item in configured_ligands or []:
-        name = str(item.get("name", "")).strip()
+        entry = dict(item)
+        # Support file/mol2 path passed either under "mol2"/"file" key or as a path in "smiles"
+        file_ref = entry.get("mol2") or entry.get("file") or ""
+        smiles_ref = str(entry.get("smiles") or "").strip()
+        if not file_ref and smiles_ref.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+            file_ref = smiles_ref
+            entry.pop("smiles", None)
+        if file_ref:
+            entry["file"] = str(file_ref)
+        name = str(entry.get("name") or (Path(str(file_ref)).stem if file_ref else "")).strip()
         if name and name not in seen_names:
+            entry["name"] = name
             seen_names.add(name)
-            merged.append(dict(item))
+            merged.append(entry)
     if not raw_ligands_dir.is_dir():
         return merged
 
     for path in sorted(raw_ligands_dir.iterdir()):
-        if path.name.startswith(".") or path.suffix.lower() not in {".smi", ".csv", ".txt"}:
+        if path.name.startswith("."):
             continue
-        if path.suffix.lower() == ".csv":
+        suffix = path.suffix.lower()
+        if suffix == ".mol2":
+            try:
+                mol2_entries = parse_mol2_file(path, auto_desalt=True)
+                for m_entry in mol2_entries:
+                    m_name = m_entry["name"]
+                    if m_name not in seen_names:
+                        seen_names.add(m_name)
+                        merged.append({
+                            "name": m_name,
+                            "file": str(path),
+                            "mol2_block": m_entry["mol2_block"],
+                            "format": "mol2",
+                            "source": str(path),
+                        })
+            except Exception as exc:
+                LOGGER.warning("Skipping invalid .mol2 file %s: %s", path, exc)
+        elif suffix in {".sdf", ".mol"}:
+            try:
+                sdf_entries = parse_sdf_file(path, auto_desalt=True)
+                for s_entry in sdf_entries:
+                    s_name = s_entry["name"]
+                    if s_name not in seen_names:
+                        seen_names.add(s_name)
+                        merged.append({
+                            "name": s_name,
+                            "file": str(path),
+                            "sdf_block": s_entry["sdf_block"],
+                            "format": suffix.lstrip("."),
+                            "source": str(path),
+                        })
+            except Exception as exc:
+                LOGGER.warning("Skipping invalid %s file %s: %s", suffix, path, exc)
+        elif suffix in {".pdb", ".pdbqt"}:
+            name = path.stem
+            if name not in seen_names:
+                seen_names.add(name)
+                merged.append({"name": name, "file": str(path), "format": suffix.lstrip("."), "source": str(path)})
+        elif suffix == ".csv":
             with path.open(newline="", encoding="utf-8", errors="replace") as handle:
                 reader = csv.DictReader(handle)
                 for row in reader:
                     name = (row.get("name") or row.get("Name") or row.get("Ligand") or "").strip()
                     smiles = (row.get("smiles") or row.get("SMILES") or "").strip()
-                    if name and smiles and name not in seen_names:
-                        seen_names.add(name)
-                        merged.append({"name": name, "smiles": smiles, "source": str(path)})
-        else:
+                    mol2_col = (row.get("mol2") or row.get("MOL2") or row.get("file") or row.get("File") or "").strip()
+                    if mol2_col and not name:
+                        name = Path(mol2_col).stem
+                    if name and name not in seen_names:
+                        if mol2_col:
+                            seen_names.add(name)
+                            merged.append({"name": name, "file": mol2_col, "source": str(path)})
+                        elif smiles:
+                            seen_names.add(name)
+                            merged.append({"name": name, "smiles": smiles, "source": str(path)})
+        elif suffix in {".smi", ".txt"}:
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 text = line.strip()
                 if not text or text.startswith("#"):
                     continue
                 if "=" in text:
-                    name, smiles = [p.strip() for p in text.split("=", 1)]
+                    name, val = [p.strip() for p in text.split("=", 1)]
                 else:
                     parts = text.split()
                     if len(parts) >= 2:
-                        smiles, name = parts[0].strip(), parts[1].strip()
+                        val, name = parts[0].strip(), parts[1].strip()
+                    elif len(parts) == 1 and parts[0].lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+                        val = parts[0].strip()
+                        name = Path(val).stem
                     else:
                         continue
-                if name and smiles and name not in seen_names:
+                if name and val and name not in seen_names:
                     seen_names.add(name)
-                    merged.append({"name": name, "smiles": smiles, "source": str(path)})
+                    if val.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+                        merged.append({"name": name, "file": val, "source": str(path)})
+                    else:
+                        merged.append({"name": name, "smiles": val, "source": str(path)})
     return merged
 
 
@@ -124,12 +190,89 @@ def fetch_smiles(name: str) -> str:
     return smiles
 
 
-def prepare_ligand(
+def prepare_ligand_from_mol2(
     name: str,
-    smiles: str | None,
+    mol2_path_or_block: Path | str,
     output_dir: Path,
     auto_desalt: bool = True,
 ) -> Path:
+    """Prepare a 3D ligand directly from a Tripos .mol2 file or @<TRIPOS>MOLECULE text block, preserving 3D coordinates and compiling a flexible BRANCH PDBQT."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sdf_path = output_dir / f"{name}.sdf"
+    pdbqt_path = output_dir / f"{name}.pdbqt"
+
+    if isinstance(mol2_path_or_block, Path) or (
+        isinstance(mol2_path_or_block, str) and "@<TRIPOS>" not in mol2_path_or_block and Path(mol2_path_or_block).is_file()
+    ):
+        m_path = Path(mol2_path_or_block)
+        entries = parse_mol2_file(m_path, auto_desalt=auto_desalt)
+        matched = next((e for e in entries if e["name"] == name), entries[0])
+    else:
+        matched = parse_mol2_block(str(mol2_path_or_block), default_name=name, auto_desalt=auto_desalt)
+
+    if matched.get("was_desalted"):
+        LOGGER.info("Auto-desalted MOL2 ligand %s: stripped counterions %s", name, matched.get("stripped_counterions"))
+
+    write_fallback_sdf(name, matched["atoms"], matched["bonds"], sdf_path)
+    return write_fallback_pdbqt(name, matched["atoms"], pdbqt_path, bonds=matched["bonds"])
+
+
+def prepare_ligand_from_sdf_or_pdb(
+    name: str,
+    file_or_block: Path | str,
+    output_dir: Path,
+    fmt: str = "sdf",
+    auto_desalt: bool = True,
+) -> Path:
+    """Prepare a 3D ligand directly from an .sdf/.mol file/block or .pdb file, preserving 3D coordinates and compiling a flexible BRANCH PDBQT."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sdf_path = output_dir / f"{name}.sdf"
+    pdbqt_path = output_dir / f"{name}.pdbqt"
+    if fmt == "pdb":
+        matched = parse_pdb_ligand_file(Path(file_or_block), default_name=name, auto_desalt=auto_desalt)
+    elif isinstance(file_or_block, Path) or (isinstance(file_or_block, str) and "V2000" not in file_or_block and Path(file_or_block).is_file()):
+        entries = parse_sdf_file(Path(file_or_block), auto_desalt=auto_desalt)
+        matched = next((e for e in entries if e["name"] == name), entries[0])
+    else:
+        matched = parse_sdf_block(str(file_or_block), default_name=name, auto_desalt=auto_desalt)
+    write_fallback_sdf(name, matched["atoms"], matched["bonds"], sdf_path)
+    return write_fallback_pdbqt(name, matched["atoms"], pdbqt_path, bonds=matched["bonds"])
+
+
+def prepare_ligand(
+    name: str,
+    smiles: str | None = None,
+    output_dir: Path = Path("data/04_prepped_ligands"),
+    auto_desalt: bool = True,
+    file_path: str | Path | None = None,
+    mol2_block: str | None = None,
+    sdf_block: str | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if mol2_block:
+        return prepare_ligand_from_mol2(name, mol2_block, output_dir, auto_desalt=auto_desalt)
+    if sdf_block:
+        return prepare_ligand_from_sdf_or_pdb(name, sdf_block, output_dir, fmt="sdf", auto_desalt=auto_desalt)
+
+    candidate_file = file_path or (
+        smiles if (smiles and str(smiles).strip().lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt"))) else None
+    )
+    if candidate_file is not None:
+        c_path = Path(candidate_file)
+        if c_path.is_file():
+            ext = c_path.suffix.lower()
+            if ext == ".mol2":
+                return prepare_ligand_from_mol2(name, c_path, output_dir, auto_desalt=auto_desalt)
+            if ext in {".sdf", ".mol"}:
+                return prepare_ligand_from_sdf_or_pdb(name, c_path, output_dir, fmt="sdf", auto_desalt=auto_desalt)
+            if ext == ".pdb":
+                return prepare_ligand_from_sdf_or_pdb(name, c_path, output_dir, fmt="pdb", auto_desalt=auto_desalt)
+            if ext == ".pdbqt":
+                dest = output_dir / f"{name}.pdbqt"
+                if c_path.resolve() != dest.resolve():
+                    dest.write_text(c_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                return dest
+
     resolved_smiles = smiles or fetch_smiles(name)
     if auto_desalt:
         desalt_info = standardize_and_desalt_smiles(resolved_smiles)
@@ -319,9 +462,7 @@ def prepare_ring_conformer_ensemble(
         mol = Chem.AddHs(mol)
         params = AllChem.ETKDGv3()
         params.randomSeed = 0xA1D0
-        # Keep the requested ensemble cardinality. Diversity is assessed downstream;
-        # RDKit's pruning can otherwise collapse small rings to a single conformer.
-        params.pruneRmsThresh = -1.0
+        params.pruneRmsThresh = rmsd_threshold
         params.useSmallRingTorsions = True
         if hasattr(params, "useMacrocycleTorsions"):
             params.useMacrocycleTorsions = True

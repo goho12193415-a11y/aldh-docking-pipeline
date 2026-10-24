@@ -12,6 +12,13 @@ from src.common import (
     enumerate_ph_protonation_states,
     enumerate_stereoisomers_and_tautomers,
     estimate_receptor_microenvironment_pka,
+    parse_mol2_block,
+    compute_admet_druglikeness,
+    convert_cif_to_pdb,
+    parse_mol2_file,
+    parse_pdb_ligand_file,
+    parse_sdf_block,
+    parse_sdf_file,
     parse_smiles_tokens,
     generate_fallback_3d_coords,
     standardize_and_desalt_smiles,
@@ -20,7 +27,7 @@ from src.common import (
 from src.mechanism_templates import list_supported_mechanisms, load_mechanism_template, mechanism_capability
 from src.step10_evaluation import _bedroc, _enrichment_factor, _pr_auc, _roc_auc, evaluate_experimental_data
 from src.step6_interaction_viz import analyze_interactions
-from src.step1_ligand_prep import enumerate_ligand_variants, prepare_polysaccharide_conformers, prepare_ring_conformer_ensemble
+from src.step1_ligand_prep import discover_raw_ligands, enumerate_ligand_variants, prepare_ligand, prepare_polysaccharide_conformers, prepare_ring_conformer_ensemble
 from src.step2_receptor_prep import (
     detect_bridging_waters,
     prepare_flexible_receptor_pdbqt,
@@ -38,6 +45,7 @@ from src.step7_advanced import (
     assess_enzyme_readiness,
     assess_ligand_chemical_state,
     assess_ligand_compatibility,
+    assess_mol2_ligand,
     audit_docking_box,
     audit_receptor_state,
     build_capability_report,
@@ -57,6 +65,7 @@ from src.system_upgrade import (
     build_flexible_receptor_plan,
     build_multi_box_plan,
     build_workflow_readiness,
+    generate_visual_html_report,
 )
 
 
@@ -710,7 +719,10 @@ class GeometryTests(unittest.TestCase):
     def test_ring_conformer_ensemble_generation_and_multi_model_pdbqt_merge(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            pdbqts, manifest = prepare_ring_conformer_ensemble("cyclohexane_carbaldehyde", "O=CC1CCCCC1", root / "confs", num_conformers=3)
+            pdbqts, manifest = prepare_ring_conformer_ensemble(
+                "cyclohexane_carbaldehyde", "O=CC1CCCCC1", root / "confs",
+                num_conformers=3, rmsd_threshold=0.0,
+            )
             self.assertEqual(len(pdbqts), 3)
             self.assertTrue(manifest.is_file())
             out1 = root / "conf1_out.pdbqt"
@@ -933,6 +945,231 @@ class GeometryTests(unittest.TestCase):
         df = pd.read_csv(Path(__file__).resolve().parents[1] / "reports" / "docking_summary.csv")
         self.assertIn("Refinement_Delta_E_kcal", df.columns)
         self.assertIn("Refinement_RMSD_A", df.columns)
+
+
+    def test_mol2_single_and_multimol_parsing_preserves_3d_coords_and_charges(self):
+        sample_mol2 = """@<TRIPOS>MOLECULE
+Hexanal_Mol2
+ 7 6 0 0 0
+SMALL
+GASTEIGER
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.3     1  LIG1       -0.0600
+      2 C2          1.5200    0.0000    0.0000 C.3     1  LIG1       -0.0500
+      3 C3          2.2800    1.3100    0.0000 C.3     1  LIG1       -0.0400
+      4 C4          3.8000    1.3100    0.0000 C.3     1  LIG1       -0.0300
+      5 C5          4.5600    2.6200    0.0000 C.3     1  LIG1        0.0400
+      6 C6          6.0600    2.6200    0.0000 C.2     1  LIG1        0.2800
+      7 O1          6.6800    3.6800    0.0000 O.2     1  LIG1       -0.3800
+@<TRIPOS>BOND
+     1     1     2    1
+     2     2     3    1
+     3     3     4    1
+     4     4     5    1
+     5     5     6    1
+     6     6     7    2
+"""
+        parsed = parse_mol2_block(sample_mol2)
+        self.assertEqual(parsed["name"], "Hexanal_Mol2")
+        self.assertEqual(parsed["heavy_atom_count"], 7)
+        self.assertEqual(parsed["rotatable_bond_count"], 4)
+        self.assertTrue(parsed["has_mol2_charges"])
+        self.assertAlmostEqual(float(parsed["atoms"][6]["charge"]), -0.38, places=2)
+
+    def test_prepare_ligand_from_mol2_compiles_flexible_branch_pdbqt(self):
+        sample_mol2 = """@<TRIPOS>MOLECULE
+Hexanal_Mol2
+ 7 6 0 0 0
+SMALL
+NO_CHARGES
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.3     1  LIG1        0.0000
+      2 C2          1.5200    0.0000    0.0000 C.3     1  LIG1        0.0000
+      3 C3          2.2800    1.3100    0.0000 C.3     1  LIG1        0.0000
+      4 C4          3.8000    1.3100    0.0000 C.3     1  LIG1        0.0000
+      5 C5          4.5600    2.6200    0.0000 C.3     1  LIG1        0.0000
+      6 C6          6.0600    2.6200    0.0000 C.2     1  LIG1        0.0000
+      7 O1          6.6800    3.6800    0.0000 O.2     1  LIG1        0.0000
+@<TRIPOS>BOND
+     1     1     2    1
+     2     2     3    1
+     3     3     4    1
+     4     4     5    1
+     5     5     6    1
+     6     6     7    2
+"""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            mol2_file = root / "Hexanal_Mol2.mol2"
+            mol2_file.write_text(sample_mol2, encoding="utf-8")
+            pdbqt = prepare_ligand("Hexanal_Mol2", None, root / "out", file_path=mol2_file)
+            txt = pdbqt.read_text(encoding="utf-8")
+            self.assertIn("TORSDOF 4", txt)
+            self.assertEqual(txt.count("\nBRANCH "), 4)
+            self.assertIn("6.680   3.680   0.000", txt)
+
+    def test_discover_raw_ligands_auto_ingests_mol2_files_and_csv_mol2_paths(self):
+        multimol_text = """@<TRIPOS>MOLECULE
+MolA
+ 2 1 0 0 0
+SMALL
+NO_CHARGES
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.2     1  LIG         0.0000
+      2 O1          1.2200    0.0000    0.0000 O.2     1  LIG         0.0000
+@<TRIPOS>BOND
+     1     1     2    2
+@<TRIPOS>MOLECULE
+MolB
+ 2 1 0 0 0
+SMALL
+NO_CHARGES
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.3     1  LIG         0.0000
+      2 O1          1.4200    0.0000    0.0000 O.3     1  LIG         0.0000
+@<TRIPOS>BOND
+     1     1     2    1
+"""
+        with TemporaryDirectory() as directory:
+            raw_dir = Path(directory)
+            (raw_dir / "library.mol2").write_text(multimol_text, encoding="utf-8")
+            found = discover_raw_ligands(raw_dir, [])
+            names = [item["name"] for item in found]
+            self.assertIn("MolA", names)
+            self.assertIn("MolB", names)
+
+    def test_assess_mol2_ligand_audits_compatibility_and_chemical_state(self):
+        mol2_with_salt = """@<TRIPOS>MOLECULE
+Acetate_Salt
+ 4 2 0 0 0
+SMALL
+GASTEIGER
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.2     1  LIG         0.4000
+      2 O1          1.2500    0.0000    0.0000 O.co2   1  LIG        -0.7000
+      3 O2         -0.6500    1.1000    0.0000 O.co2   1  LIG        -0.7000
+      4 NA1         5.0000    5.0000    5.0000 Na      2  NA          1.0000
+@<TRIPOS>BOND
+     1     1     2   ar
+     2     1     3   ar
+"""
+        compat, chem = assess_mol2_ligand("Acetate_Salt", mol2_block=mol2_with_salt, ph=7.4)
+        self.assertEqual(compat["input_format"], "mol2")
+        self.assertEqual(compat["heavy_atom_count"], 3)
+        self.assertTrue(chem["was_desalted"])
+        self.assertIn("NA", chem["stripped_counterions"])
+        self.assertIn("carboxylic_acid_or_carboxylate", chem["acidic_site_types"])
+
+    def test_multi_receptor_discovery_and_quick_start_mol2_support(self):
+        from main import discover_raw_receptors
+        from scripts.quick_start import _parse_ligands
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            rec_dir = root / "data" / "01_raw_receptors"
+            rec_dir.mkdir(parents=True)
+            r1 = rec_dir / "rec1.pdb"
+            r2 = rec_dir / "rec2.pdb"
+            r1.write_text(_pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 0.0, 0.0, 0.0, "C") + "\nEND\n", encoding="utf-8")
+            r2.write_text(_pdb_atom("ATOM", 1, "CA", "CYS", "A", 302, 1.0, 0.0, 0.0, "C") + "\nEND\n", encoding="utf-8")
+            cfg = {"receptor": {"input_pdb": str(r1), "auto_discover_receptors": True}}
+            receptors = discover_raw_receptors(root, cfg)
+            self.assertEqual(len(receptors), 2)
+            ligs = _parse_ligands(["MyMol=test_ligand.mol2", "other.mol2"])
+            self.assertEqual(ligs[0]["file"], "test_ligand.mol2")
+            self.assertEqual(ligs[1]["name"], "other")
+
+
+    def test_sdf_and_pdb_ligand_3d_parsing_and_branch_compilation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            parsed_smi = parse_smiles_tokens("CCCCCC=O")
+            coords = generate_fallback_3d_coords(parsed_smi, seed=11)
+            from src.common import write_fallback_sdf
+            sdf_file = write_fallback_sdf("Hexanal_SDF", coords, parsed_smi["bonds"], root / "Hexanal_SDF.sdf")
+            sdf_entries = parse_sdf_file(sdf_file)
+            self.assertEqual(len(sdf_entries), 1)
+            self.assertEqual(sdf_entries[0]["heavy_atom_count"], 7)
+            pdbqt_from_sdf = prepare_ligand("Hexanal_SDF", None, root / "out_sdf", file_path=sdf_file)
+            self.assertIn("TORSDOF 4", pdbqt_from_sdf.read_text(encoding="utf-8"))
+
+            lig_pdb = root / "lig.pdb"
+            lig_pdb.write_text("\n".join([
+                _pdb_atom("HETATM", 1, "C1", "LIG", "L", 1, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 2, "C2", "LIG", "L", 1, 1.52, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 3, "C3", "LIG", "L", 1, 2.28, 1.31, 0.0, "C"),
+                _pdb_atom("HETATM", 4, "O1", "LIG", "L", 1, 3.50, 1.31, 0.0, "O"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            pdbqt_from_pdb = prepare_ligand("Propanal_PDB", None, root / "out_pdb", file_path=lig_pdb)
+            self.assertIn("BRANCH", pdbqt_from_pdb.read_text(encoding="utf-8"))
+
+    def test_cif_mmcif_receptor_auto_conversion_and_parsing(self):
+        cif_text = """data_test
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N . CYS A 302 1.000 2.000 3.000 1.00 15.00 1
+ATOM 2 C CA . CYS A 302 2.450 2.000 3.000 1.00 15.00 1
+ATOM 3 C C . CYS A 302 3.100 3.300 3.000 1.00 15.00 1
+ATOM 4 O O . CYS A 302 2.500 4.350 3.000 1.00 15.00 1
+ATOM 5 C CB . CYS A 302 3.000 1.100 1.900 1.00 15.00 1
+ATOM 6 S SG . CYS A 302 4.750 1.100 1.900 1.00 15.00 1
+"""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cif_path = root / "receptor.cif"
+            cif_path.write_text(cif_text, encoding="utf-8")
+            pdb_out = convert_cif_to_pdb(cif_path, root / "converted.pdb")
+            self.assertTrue(pdb_out.is_file())
+            struct = PDBParser(QUIET=True).get_structure("cif_test", str(pdb_out))
+            self.assertIn("A", struct[0])
+            self.assertIn((" ", 302, " "), struct[0]["A"])
+
+    def test_admet_lipinski_veber_and_qed_druglikeness_calculator(self):
+        admet = compute_admet_druglikeness("Hexanal", smiles="CCCCCC=O")
+        self.assertTrue(admet["Lipinski_Rule_of_5_Pass"])
+        self.assertTrue(admet["Veber_Oral_Pass"])
+        self.assertEqual(admet["HBA_Count"], 1)
+        self.assertEqual(admet["HBD_Count"], 0)
+        self.assertGreater(admet["TPSA_A2"], 15.0)
+        self.assertGreater(admet["QED_DrugLikeness_Score"], 0.4)
+
+    def test_visual_html_report_generates_chinese_scorecard_and_3d_viewer_json(self):
+        project_root = Path(__file__).resolve().parents[1]
+        html_path = generate_visual_html_report(project_root)
+        self.assertTrue(html_path.is_file())
+        html_text = html_path.read_text(encoding="utf-8")
+        self.assertIn("const POSES =", html_text)
+        self.assertIn("Lipinski", html_text)
+        self.assertIn("Hexanal", html_text)
+
+    def test_pipeline_generates_admet_csv_and_receptor_column_in_docking_summary(self):
+        import pandas as pd
+        project_root = Path(__file__).resolve().parents[1]
+        admet_csv = project_root / "reports" / "admet_druglikeness.csv"
+        summary_csv = project_root / "reports" / "docking_summary.csv"
+        html_report = project_root / "reports" / "对接结果可视化总览报告.html"
+        self.assertTrue(admet_csv.is_file())
+        self.assertTrue(html_report.is_file())
+        df_sum = pd.read_csv(summary_csv)
+        self.assertIn("Receptor", df_sum.columns)
 
 
 if __name__ == "__main__":

@@ -422,6 +422,8 @@ class FallbackPDBParser:
 
     def get_structure(self, structure_id: str, file_path: str | Path) -> FallbackStructure:
         path = Path(file_path)
+        if path.suffix.lower() in {".cif", ".mmcif"}:
+            path = convert_cif_to_pdb(path)
         text = path.read_text(encoding="utf-8", errors="replace")
         structure = FallbackStructure(structure_id)
         current_model: FallbackModel | None = None
@@ -1506,3 +1508,823 @@ def write_fallback_pdbqt(
     lines.append(f"TORSDOF {emitted_branches}")
     pdbqt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return pdbqt_path
+
+
+def parse_mol2_block(mol2_text: str, default_name: str = "Ligand", auto_desalt: bool = True) -> dict:
+    """Parse a single Tripos @<TRIPOS>MOLECULE block into heavy-atom 3D records, bonds, SYBYL types, and partial charges."""
+    lines = mol2_text.splitlines()
+    section = ""
+    mol_name = default_name
+    mol_line_idx = 0
+    raw_atoms: list[dict] = []
+    raw_bonds: list[tuple[int, int, int, bool]] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("@<TRIPOS>"):
+            section = stripped.upper()
+            mol_line_idx = 0
+            continue
+
+        if section == "@<TRIPOS>MOLECULE":
+            mol_line_idx += 1
+            if mol_line_idx == 1 and stripped and stripped != "*****":
+                mol_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", stripped).strip("_") or default_name
+        elif section == "@<TRIPOS>ATOM":
+            parts = stripped.split()
+            if len(parts) < 6:
+                continue
+            try:
+                atom_id = int(parts[0])
+                atom_name = parts[1]
+                x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+                sybyl_type = parts[5]
+                charge = float(parts[8]) if len(parts) >= 9 else 0.0
+            except ValueError:
+                continue
+            base_sym = sybyl_type.split(".")[0].strip()
+            element = base_sym.upper()
+            if element not in ATOMIC_WEIGHTS:
+                alpha = "".join(ch for ch in atom_name if ch.isalpha())
+                element = (alpha[:2].upper() if alpha[:2].upper() in {"CL", "BR", "NA", "MG", "ZN", "FE", "CA", "CU", "MN"} else alpha[:1].upper()) or "C"
+            is_aromatic = ".ar" in sybyl_type.lower()
+            raw_atoms.append({
+                "mol2_id": atom_id,
+                "name": atom_name[:4],
+                "symbol": element,
+                "sybyl_type": sybyl_type,
+                "aromatic": is_aromatic,
+                "coord": np.array([x, y, z], dtype=float),
+                "charge": charge,
+            })
+        elif section == "@<TRIPOS>BOND":
+            parts = stripped.split()
+            if len(parts) < 4:
+                continue
+            try:
+                u_id = int(parts[1])
+                v_id = int(parts[2])
+                b_type = parts[3].lower()
+            except ValueError:
+                continue
+            order = 2 if b_type == "2" else (3 if b_type == "3" else 1)
+            is_arom_bond = b_type == "ar"
+            raw_bonds.append((u_id, v_id, order, is_arom_bond))
+
+    if not raw_atoms:
+        raise ValueError(f"No valid @<TRIPOS>ATOM records found in MOL2 block for {default_name}")
+
+    id_to_raw_idx = {a["mol2_id"]: idx for idx, a in enumerate(raw_atoms)}
+    raw_adj: dict[int, list[tuple[int, int, bool]]] = {i: [] for i in range(len(raw_atoms))}
+    for u_id, v_id, order, is_ar in raw_bonds:
+        if u_id in id_to_raw_idx and v_id in id_to_raw_idx:
+            ui, vi = id_to_raw_idx[u_id], id_to_raw_idx[v_id]
+            raw_adj[ui].append((vi, order, is_ar))
+            raw_adj[vi].append((ui, order, is_ar))
+
+    # Fold non-polar/explicit H partial charges onto their parent heavy atoms and keep heavy atoms for PDBQT
+    heavy_indices = [i for i, a in enumerate(raw_atoms) if a["symbol"] != "H"]
+    if not heavy_indices:
+        heavy_indices = list(range(len(raw_atoms)))
+
+    for i, a in enumerate(raw_atoms):
+        if a["symbol"] == "H" and raw_adj[i]:
+            parent_idx = raw_adj[i][0][0]
+            raw_atoms[parent_idx]["charge"] += a["charge"]
+
+    # Optional desalting of disconnected counterion fragments (keep largest organic heavy-atom fragment)
+    selected_heavy_set = set(heavy_indices)
+    stripped_counterions: list[str] = []
+    if auto_desalt and len(heavy_indices) > 1:
+        visited: set[int] = set()
+        components: list[list[int]] = []
+        for hi in heavy_indices:
+            if hi in visited:
+                continue
+            comp = []
+            q = [hi]
+            visited.add(hi)
+            while q:
+                cur = q.pop(0)
+                comp.append(cur)
+                for nb, _, _ in raw_adj[cur]:
+                    if nb in selected_heavy_set and nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            components.append(comp)
+        if len(components) > 1:
+            components.sort(
+                key=lambda comp_list: (
+                    int(any(raw_atoms[idx]["symbol"] == "C" for idx in comp_list)),
+                    len(comp_list),
+                ),
+                reverse=True,
+            )
+            selected_heavy_set = set(components[0])
+            for salt_comp in components[1:]:
+                stripped_counterions.append("".join(raw_atoms[idx]["symbol"] for idx in salt_comp))
+
+    kept_raw_indices = [i for i in heavy_indices if i in selected_heavy_set]
+    raw_to_new = {old_i: new_i for new_i, old_i in enumerate(kept_raw_indices)}
+
+    atoms_for_peoe: list[dict] = []
+    bonds_new: list[tuple[int, int, int, bool]] = []
+    adj_new: dict[int, list[tuple[int, int]]] = {i: [] for i in range(len(kept_raw_indices))}
+
+    # Build heavy-atom bond graph and detect ring closures via BFS
+    temp_edges: list[tuple[int, int, int, bool]] = []
+    temp_adj: dict[int, list[int]] = {i: [] for i in range(len(kept_raw_indices))}
+    for u_id, v_id, order, is_ar in raw_bonds:
+        if u_id in id_to_raw_idx and v_id in id_to_raw_idx:
+            uo, vo = id_to_raw_idx[u_id], id_to_raw_idx[v_id]
+            if uo in raw_to_new and vo in raw_to_new:
+                un, vn = raw_to_new[uo], raw_to_new[vo]
+                temp_edges.append((un, vn, order, is_ar))
+                temp_adj[un].append(vn)
+                temp_adj[vn].append(un)
+
+    for un, vn, order, is_ar in temp_edges:
+        # Check if (un, vn) lies on a cycle
+        vis = {un}
+        q = [un]
+        in_ring = False
+        while q:
+            cur = q.pop(0)
+            if cur == vn:
+                in_ring = True
+                break
+            for nb in temp_adj[cur]:
+                if (cur == un and nb == vn) or (cur == vn and nb == un):
+                    continue
+                if nb not in vis:
+                    vis.add(nb)
+                    q.append(nb)
+        bonds_new.append((un, vn, order, in_ring or is_ar))
+        adj_new[un].append((vn, order))
+        adj_new[vn].append((un, order))
+
+    for new_i, old_i in enumerate(kept_raw_indices):
+        ra = raw_atoms[old_i]
+        h_attached = sum(1 for nb, _, _ in raw_adj[old_i] if raw_atoms[nb]["symbol"] == "H")
+        formal_q = 0
+        st_low = ra["sybyl_type"].lower()
+        if st_low in {"n.4", "n.cat", "c.cat"}:
+            formal_q = 1
+        elif st_low == "o.co2":
+            formal_q = -1
+        atoms_for_peoe.append({
+            "index": new_i,
+            "symbol": ra["symbol"],
+            "aromatic": ra["aromatic"],
+            "implicit_h": h_attached,
+            "charge": formal_q,
+        })
+
+    # Use MOL2 partial charges if non-zero; otherwise compute 6-iteration Gasteiger-Marsili PEOE charges
+    has_mol2_charges = any(abs(raw_atoms[old_i]["charge"]) > 1e-4 for old_i in kept_raw_indices)
+    peoe_charges = compute_peoe_charges(atoms_for_peoe, adj_new, iterations=6) if not has_mol2_charges else [
+        round(float(raw_atoms[old_i]["charge"]), 4) for old_i in kept_raw_indices
+    ]
+
+    atom_records: list[dict] = []
+    for new_i, old_i in enumerate(kept_raw_indices):
+        ra = raw_atoms[old_i]
+        sym = ra["symbol"]
+        st_low = ra["sybyl_type"].lower()
+        h_attached = atoms_for_peoe[new_i]["implicit_h"]
+        if sym == "O":
+            ad_type = "OA"
+        elif sym == "N":
+            ad_type = "NA" if (h_attached == 0 and st_low not in {"n.am", "n.pl3", "n.4"}) else "N"
+        elif sym == "S":
+            ad_type = "SA" if h_attached == 0 else "S"
+        elif sym == "C" and ra["aromatic"]:
+            ad_type = "A"
+        else:
+            ad_type = sym
+        atom_records.append({
+            "serial": new_i + 1,
+            "name": ra["name"] or f"{sym}{new_i + 1}"[:4],
+            "symbol": sym,
+            "sybyl_type": ra["sybyl_type"],
+            "aromatic": ra["aromatic"],
+            "implicit_h": h_attached,
+            "ad_type": ad_type,
+            "coord": ra["coord"],
+            "charge": float(peoe_charges[new_i]),
+        })
+
+    ring_count = max(0, len(bonds_new) - len(atom_records) + 1)
+    rotatable_bonds = 0
+    for u, v, order, is_ring in bonds_new:
+        if is_ring or order != 1:
+            continue
+        if len(adj_new[u]) > 1 and len(adj_new[v]) > 1:
+            rotatable_bonds += 1
+
+    total_h = sum(a["implicit_h"] for a in atoms_for_peoe)
+    mw = sum(ATOMIC_WEIGHTS.get(a["symbol"], 12.0) for a in atom_records) + total_h * ATOMIC_WEIGHTS["H"]
+
+    return {
+        "name": mol_name,
+        "atoms": atom_records,
+        "peoe_atoms": atoms_for_peoe,
+        "bonds": bonds_new,
+        "adj": adj_new,
+        "heavy_atom_count": len(atom_records),
+        "ring_count": ring_count,
+        "rotatable_bond_count": rotatable_bonds,
+        "formal_charge": int(round(sum(a["charge"] for a in atom_records))),
+        "molecular_weight": round(mw, 3),
+        "was_desalted": bool(stripped_counterions),
+        "stripped_counterions": stripped_counterions,
+        "has_mol2_charges": has_mol2_charges,
+    }
+
+
+def parse_mol2_file(mol2_path: Path, auto_desalt: bool = True) -> list[dict]:
+    """Parse a single-molecule or multi-molecule Tripos .mol2 file into a list of parsed molecule dicts."""
+    text = mol2_path.read_text(encoding="utf-8", errors="replace")
+    raw_blocks = re.split(r"(?=@<TRIPOS>MOLECULE)", text)
+    blocks = [b for b in raw_blocks if "@<TRIPOS>ATOM" in b]
+    if not blocks:
+        raise ValueError(f"No @<TRIPOS>MOLECULE / @<TRIPOS>ATOM sections found in {mol2_path}")
+    results: list[dict] = []
+    seen_names: set[str] = set()
+    for idx, block in enumerate(blocks, 1):
+        fallback_name = mol2_path.stem if len(blocks) == 1 else f"{mol2_path.stem}_{idx}"
+        parsed = parse_mol2_block(block, default_name=fallback_name, auto_desalt=auto_desalt)
+        name = parsed["name"]
+        if name in seen_names or name.lower() in {"ligand", "mol", "unl", "none"}:
+            name = fallback_name if fallback_name not in seen_names else f"{mol2_path.stem}_{idx}"
+            parsed["name"] = name
+        seen_names.add(name)
+        parsed["source_path"] = str(mol2_path)
+        parsed["mol2_block"] = block
+        results.append(parsed)
+    return results
+
+
+def convert_cif_to_pdb(cif_path: Path, output_pdb_path: Path | None = None) -> Path:
+    """Convert a PDBx/mmCIF (.cif/.mmcif) receptor structure into a standard 80-column PDB file."""
+    if output_pdb_path is None:
+        output_pdb_path = cif_path.with_suffix(".converted.pdb")
+    text = cif_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+
+    headers: list[str] = []
+    pdb_lines: list[str] = []
+    in_atom_loop = False
+    serial = 1
+    first_model_num: str | None = None
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        if stripped == "loop_":
+            j = i + 1
+            loop_cols: list[str] = []
+            while j < n and lines[j].strip().startswith("_"):
+                loop_cols.append(lines[j].strip())
+                j += 1
+            if loop_cols and all(c.startswith("_atom_site.") for c in loop_cols):
+                headers = [c.split(".", 1)[1].strip() for c in loop_cols]
+                in_atom_loop = True
+                i = j
+                continue
+            else:
+                in_atom_loop = False
+        elif in_atom_loop:
+            if not stripped or stripped.startswith(("#", "loop_", "_")) or stripped.startswith("data_"):
+                in_atom_loop = False
+            else:
+                # Tokenize preserving quoted strings
+                tokens = [m.group(1) or m.group(2) or m.group(0) for m in re.finditer(r"'([^']*)'|\"([^\"]*)\"|(\S+)", stripped)]
+                if len(tokens) >= len(headers):
+                    row = dict(zip(headers, tokens))
+                    model_num = row.get("pdbx_PDB_model_num", "1")
+                    if first_model_num is None:
+                        first_model_num = model_num
+                    elif model_num != first_model_num:
+                        i += 1
+                        continue
+                    record = row.get("group_PDB", "ATOM").upper()
+                    if record not in {"ATOM", "HETATM"}:
+                        record = "ATOM"
+                    atom_name = (row.get("auth_atom_id") or row.get("label_atom_id") or "C").strip()
+                    element = (row.get("type_symbol") or atom_name[:1] or "C").strip().upper()
+                    element = "".join(ch for ch in element if ch.isalpha())[:2] or "C"
+                    altloc = row.get("label_alt_id", ".")
+                    altloc = " " if altloc in {".", "?"} else altloc[:1]
+                    resname = (row.get("auth_comp_id") or row.get("label_comp_id") or "UNK").strip()[:3]
+                    chain_id = (row.get("auth_asym_id") or row.get("label_asym_id") or "A").strip()[:1] or "A"
+                    seq_str = (row.get("auth_seq_id") or row.get("label_seq_id") or "1").strip()
+                    try:
+                        resseq = int(seq_str)
+                    except ValueError:
+                        resseq = 1
+                    icode = row.get("pdbx_PDB_ins_code", ".")
+                    icode = " " if icode in {".", "?"} else icode[:1]
+                    try:
+                        x = float(row.get("Cartn_x", "0.0"))
+                        y = float(row.get("Cartn_y", "0.0"))
+                        z = float(row.get("Cartn_z", "0.0"))
+                    except ValueError:
+                        i += 1
+                        continue
+                    try:
+                        occ = float(row.get("occupancy", "1.0"))
+                    except ValueError:
+                        occ = 1.0
+                    try:
+                        bfac = float(row.get("B_iso_or_equiv", "20.0"))
+                    except ValueError:
+                        bfac = 20.0
+
+                    if len(atom_name) < 4 and len(element) == 1:
+                        fmt_name = f" {atom_name:<3s}"
+                    else:
+                        fmt_name = f"{atom_name:<4s}"[:4]
+                    pdb_lines.append(
+                        f"{record:<6s}{serial:5d} {fmt_name}{altloc:1s}{resname:>3s} "
+                        f"{chain_id:1s}{resseq:4d}{icode:1s}   "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}{occ:6.2f}{bfac:6.2f}          {element:>2s}  "
+                    )
+                    serial += 1
+        i += 1
+
+    if not pdb_lines:
+        raise ValueError(f"No valid _atom_site records found in CIF file: {cif_path}")
+    pdb_lines.append("END")
+    output_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+    output_pdb_path.write_text("\n".join(pdb_lines) + "\n", encoding="utf-8")
+    return output_pdb_path
+
+
+def parse_sdf_block(sdf_text: str, default_name: str = "Ligand", auto_desalt: bool = True) -> dict:
+    """Parse a V2000 .sdf / .mol structure block into 3D heavy-atom records, bonds, PEOE charges, and topological descriptors."""
+    lines = sdf_text.splitlines()
+    if len(lines) < 4:
+        raise ValueError(f"Invalid SDF/MOL block for {default_name}")
+    raw_title = lines[0].strip()
+    mol_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_title).strip("_") if raw_title else default_name
+    if not mol_name or mol_name.lower() in {"ligand", "mol", "none", "unl"}:
+        mol_name = default_name
+
+    counts_line = lines[3]
+    try:
+        n_atoms = int(counts_line[0:3].strip())
+        n_bonds = int(counts_line[3:6].strip())
+    except ValueError:
+        parts = counts_line.split()
+        if len(parts) < 2:
+            raise ValueError(f"Cannot parse SDF counts line: {counts_line}")
+        n_atoms, n_bonds = int(parts[0]), int(parts[1])
+
+    raw_atoms: list[dict] = []
+    for idx in range(4, min(len(lines), 4 + n_atoms)):
+        line = lines[idx]
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            sym = parts[3].strip().upper()
+        except ValueError:
+            continue
+        if sym not in ATOMIC_WEIGHTS:
+            sym = sym[:1] if sym[:1] in ATOMIC_WEIGHTS else "C"
+        raw_atoms.append({
+            "sdf_id": len(raw_atoms) + 1,
+            "name": f"{sym}{len(raw_atoms) + 1}"[:4],
+            "symbol": sym,
+            "coord": np.array([x, y, z], dtype=float),
+            "formal_charge": 0,
+        })
+
+    raw_bonds: list[tuple[int, int, int]] = []
+    bond_start = 4 + n_atoms
+    for idx in range(bond_start, min(len(lines), bond_start + n_bonds)):
+        line = lines[idx]
+        try:
+            u_id = int(line[0:3].strip())
+            v_id = int(line[3:6].strip())
+            b_type = int(line[6:9].strip())
+        except ValueError:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            u_id, v_id, b_type = int(parts[0]), int(parts[1]), int(parts[2])
+        order = 2 if b_type in {2, 4} else (3 if b_type == 3 else 1)
+        raw_bonds.append((u_id - 1, v_id - 1, order))
+
+    for line in lines[bond_start + n_bonds:]:
+        if line.startswith("M  CHG"):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    cnt = int(parts[2])
+                    for k in range(cnt):
+                        a_idx = int(parts[3 + 2 * k]) - 1
+                        chg = int(parts[4 + 2 * k])
+                        if 0 <= a_idx < len(raw_atoms):
+                            raw_atoms[a_idx]["formal_charge"] = chg
+                except (ValueError, IndexError):
+                    pass
+
+    if not raw_atoms:
+        raise ValueError(f"No atoms parsed from SDF block for {default_name}")
+
+    raw_adj: dict[int, list[tuple[int, int]]] = {i: [] for i in range(len(raw_atoms))}
+    for u, v, order in raw_bonds:
+        if 0 <= u < len(raw_atoms) and 0 <= v < len(raw_atoms):
+            raw_adj[u].append((v, order))
+            raw_adj[v].append((u, order))
+
+    heavy_indices = [i for i, a in enumerate(raw_atoms) if a["symbol"] != "H"] or list(range(len(raw_atoms)))
+    selected_heavy = set(heavy_indices)
+    stripped_counterions: list[str] = []
+
+    if auto_desalt and len(heavy_indices) > 1:
+        visited: set[int] = set()
+        comps: list[list[int]] = []
+        for hi in heavy_indices:
+            if hi in visited:
+                continue
+            comp = []
+            q = [hi]
+            visited.add(hi)
+            while q:
+                cur = q.pop(0)
+                comp.append(cur)
+                for nb, _ in raw_adj[cur]:
+                    if nb in selected_heavy and nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            comps.append(comp)
+        if len(comps) > 1:
+            comps.sort(key=lambda c: (int(any(raw_atoms[i]["symbol"] == "C" for i in c)), len(c)), reverse=True)
+            selected_heavy = set(comps[0])
+            for sc in comps[1:]:
+                stripped_counterions.append("".join(raw_atoms[i]["symbol"] for i in sc))
+
+    kept = [i for i in heavy_indices if i in selected_heavy]
+    old_to_new = {old_i: new_i for new_i, old_i in enumerate(kept)}
+
+    temp_adj: dict[int, list[int]] = {i: [] for i in range(len(kept))}
+    temp_edges: list[tuple[int, int, int]] = []
+    for u, v, order in raw_bonds:
+        if u in old_to_new and v in old_to_new:
+            un, vn = old_to_new[u], old_to_new[v]
+            temp_edges.append((un, vn, order))
+            temp_adj[un].append(vn)
+            temp_adj[vn].append(un)
+
+    bonds_new: list[tuple[int, int, int, bool]] = []
+    adj_new: dict[int, list[tuple[int, int]]] = {i: [] for i in range(len(kept))}
+    for un, vn, order in temp_edges:
+        vis = {un}
+        q = [un]
+        in_ring = False
+        while q:
+            cur = q.pop(0)
+            if cur == vn:
+                in_ring = True
+                break
+            for nb in temp_adj[cur]:
+                if (cur == un and nb == vn) or (cur == vn and nb == un):
+                    continue
+                if nb not in vis:
+                    vis.add(nb)
+                    q.append(nb)
+        bonds_new.append((un, vn, order, in_ring))
+        adj_new[un].append((vn, order))
+        adj_new[vn].append((un, order))
+
+    peoe_atoms: list[dict] = []
+    for new_i, old_i in enumerate(kept):
+        ra = raw_atoms[old_i]
+        explicit_h = sum(1 for nb, _ in raw_adj[old_i] if raw_atoms[nb]["symbol"] == "H")
+        bond_sum = sum(order for _, order in adj_new[new_i]) + explicit_h
+        val = DEFAULT_VALENCE.get(ra["symbol"], 0)
+        imp_h = explicit_h if explicit_h > 0 else max(0, val - bond_sum + ra["formal_charge"])
+        is_arom = any(order == 2 and is_r for u, v, order, is_r in bonds_new if u == new_i or v == new_i)
+        peoe_atoms.append({
+            "index": new_i,
+            "symbol": ra["symbol"],
+            "aromatic": is_arom,
+            "implicit_h": imp_h,
+            "charge": ra["formal_charge"],
+        })
+
+    peoe_q = compute_peoe_charges(peoe_atoms, adj_new, iterations=6)
+    atom_records: list[dict] = []
+    for new_i, old_i in enumerate(kept):
+        ra = raw_atoms[old_i]
+        pa = peoe_atoms[new_i]
+        sym = ra["symbol"]
+        if sym == "O":
+            ad_type = "OA"
+        elif sym == "N":
+            ad_type = "NA" if pa["implicit_h"] == 0 else "N"
+        elif sym == "S":
+            ad_type = "SA" if pa["implicit_h"] == 0 else "S"
+        elif sym == "C" and pa["aromatic"]:
+            ad_type = "A"
+        else:
+            ad_type = sym
+        atom_records.append({
+            "serial": new_i + 1,
+            "name": ra["name"],
+            "symbol": sym,
+            "aromatic": pa["aromatic"],
+            "implicit_h": pa["implicit_h"],
+            "ad_type": ad_type,
+            "coord": ra["coord"],
+            "charge": float(peoe_q[new_i]),
+        })
+
+    ring_count = max(0, len(bonds_new) - len(atom_records) + 1)
+    rotatable_bonds = sum(
+        1 for u, v, order, is_ring in bonds_new
+        if not is_ring and order == 1 and len(adj_new[u]) > 1 and len(adj_new[v]) > 1
+    )
+    total_h = sum(a["implicit_h"] for a in peoe_atoms)
+    mw = sum(ATOMIC_WEIGHTS.get(a["symbol"], 12.0) for a in atom_records) + total_h * ATOMIC_WEIGHTS["H"]
+
+    return {
+        "name": mol_name,
+        "atoms": atom_records,
+        "peoe_atoms": peoe_atoms,
+        "bonds": bonds_new,
+        "adj": adj_new,
+        "heavy_atom_count": len(atom_records),
+        "ring_count": ring_count,
+        "rotatable_bond_count": rotatable_bonds,
+        "formal_charge": sum(a["charge"] for a in peoe_atoms),
+        "molecular_weight": round(mw, 3),
+        "was_desalted": bool(stripped_counterions),
+        "stripped_counterions": stripped_counterions,
+        "has_mol2_charges": False,
+    }
+
+
+def parse_sdf_file(sdf_path: Path, auto_desalt: bool = True) -> list[dict]:
+    """Parse a single- or multi-molecule .sdf / .mol file into a list of parsed structure dicts."""
+    text = sdf_path.read_text(encoding="utf-8", errors="replace")
+    raw_blocks = [b.strip() for b in text.split("$$$$") if "V2000" in b or len(b.strip().splitlines()) >= 5]
+    if not raw_blocks:
+        raise ValueError(f"No valid molecule blocks found in {sdf_path}")
+    results: list[dict] = []
+    seen: set[str] = set()
+    for idx, block in enumerate(raw_blocks, 1):
+        fallback_name = sdf_path.stem if len(raw_blocks) == 1 else f"{sdf_path.stem}_{idx}"
+        parsed = parse_sdf_block(block, default_name=fallback_name, auto_desalt=auto_desalt)
+        name = parsed["name"]
+        if name in seen:
+            name = f"{sdf_path.stem}_{idx}"
+            parsed["name"] = name
+        seen.add(name)
+        parsed["source_path"] = str(sdf_path)
+        parsed["sdf_block"] = block
+        results.append(parsed)
+    return results
+
+
+def parse_pdb_ligand_file(pdb_path: Path, default_name: str | None = None, auto_desalt: bool = True) -> dict:
+    """Parse a 3D ligand .pdb file into heavy-atom records, inferred covalent bonds, PEOE charges, and topological descriptors."""
+    name = default_name or pdb_path.stem
+    raw_atoms: list[dict] = []
+    for line in pdb_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            a = atom_dict(line)
+            if a["element"].upper() != "H":
+                raw_atoms.append(a)
+    if not raw_atoms:
+        raise ValueError(f"No heavy atoms found in ligand PDB: {pdb_path}")
+
+    n = len(raw_atoms)
+    temp_adj: dict[int, list[int]] = {i: [] for i in range(n)}
+    temp_edges: list[tuple[int, int, int]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = distance(raw_atoms[i]["coord"], raw_atoms[j]["coord"])
+            if 0.85 <= d <= 1.88:
+                order = 2 if d < 1.38 else 1
+                temp_edges.append((i, j, order))
+                temp_adj[i].append(j)
+                temp_adj[j].append(i)
+
+    bonds_new: list[tuple[int, int, int, bool]] = []
+    adj_new: dict[int, list[tuple[int, int]]] = {i: [] for i in range(n)}
+    for u, v, order in temp_edges:
+        vis = {u}
+        q = [u]
+        in_ring = False
+        while q:
+            cur = q.pop(0)
+            if cur == v:
+                in_ring = True
+                break
+            for nb in temp_adj[cur]:
+                if (cur == u and nb == v) or (cur == v and nb == u):
+                    continue
+                if nb not in vis:
+                    vis.add(nb)
+                    q.append(nb)
+        bonds_new.append((u, v, order, in_ring))
+        adj_new[u].append((v, order))
+        adj_new[v].append((u, order))
+
+    peoe_atoms: list[dict] = []
+    for i, ra in enumerate(raw_atoms):
+        sym = ra["element"].upper()
+        bond_sum = sum(order for _, order in adj_new[i])
+        imp_h = max(0, DEFAULT_VALENCE.get(sym, 0) - bond_sum)
+        is_arom = any(order == 2 and is_r for u, v, order, is_r in bonds_new if u == i or v == i)
+        peoe_atoms.append({
+            "index": i,
+            "symbol": sym,
+            "aromatic": is_arom,
+            "implicit_h": imp_h,
+            "charge": 0,
+        })
+
+    peoe_q = compute_peoe_charges(peoe_atoms, adj_new, iterations=6)
+    atom_records: list[dict] = []
+    for i, ra in enumerate(raw_atoms):
+        sym = ra["element"].upper()
+        pa = peoe_atoms[i]
+        ad_type = "OA" if sym == "O" else ("NA" if sym == "N" and pa["implicit_h"] == 0 else ("A" if sym == "C" and pa["aromatic"] else sym))
+        atom_records.append({
+            "serial": i + 1,
+            "name": ra["name"][:4] or f"{sym}{i + 1}"[:4],
+            "symbol": sym,
+            "aromatic": pa["aromatic"],
+            "implicit_h": pa["implicit_h"],
+            "ad_type": ad_type,
+            "coord": ra["coord"],
+            "charge": float(peoe_q[i]),
+        })
+
+    ring_count = max(0, len(bonds_new) - n + 1)
+    rotatable_bonds = sum(
+        1 for u, v, order, is_ring in bonds_new
+        if not is_ring and order == 1 and len(adj_new[u]) > 1 and len(adj_new[v]) > 1
+    )
+    total_h = sum(a["implicit_h"] for a in peoe_atoms)
+    mw = sum(ATOMIC_WEIGHTS.get(a["symbol"], 12.0) for a in atom_records) + total_h * ATOMIC_WEIGHTS["H"]
+    return {
+        "name": name,
+        "atoms": atom_records,
+        "peoe_atoms": peoe_atoms,
+        "bonds": bonds_new,
+        "adj": adj_new,
+        "heavy_atom_count": n,
+        "ring_count": ring_count,
+        "rotatable_bond_count": rotatable_bonds,
+        "formal_charge": 0,
+        "molecular_weight": round(mw, 3),
+        "was_desalted": False,
+        "stripped_counterions": [],
+        "has_mol2_charges": False,
+    }
+
+
+def compute_admet_druglikeness(
+    name: str,
+    smiles: str | None = None,
+    parsed_structure: dict | None = None,
+) -> dict:
+    """Compute Lipinski Rule-of-5, Veber oral bioavailability, Ertl TPSA, Wildman-Crippen LogP, HBD, HBA, and QED proxy for SMILES or 3D (.mol2/.sdf/.pdb) ligands."""
+    if parsed_structure is not None:
+        atoms = parsed_structure.get("peoe_atoms") or parsed_structure.get("atoms", [])
+        adj = parsed_structure.get("adj", {})
+        mw = float(parsed_structure.get("molecular_weight", 0.0))
+        rot_bonds = int(parsed_structure.get("rotatable_bond_count", 0))
+        heavy_count = int(parsed_structure.get("heavy_atom_count", len(atoms)))
+        ring_count = int(parsed_structure.get("ring_count", 0))
+    elif smiles:
+        desalt = standardize_and_desalt_smiles(smiles)["desalted_smiles"]
+        p = parse_smiles_tokens(desalt)
+        atoms = p["atoms"]
+        adj = p["adj"]
+        mw = float(p["molecular_weight"])
+        rot_bonds = int(p["rotatable_bond_count"])
+        heavy_count = int(p["heavy_atom_count"])
+        ring_count = int(p["ring_count"])
+    else:
+        raise ValueError(f"Either smiles or parsed_structure is required for ADMET calculation of {name}")
+
+    hbd = 0
+    hba = 0
+    tpsa = 0.0
+    logp = 0.0
+
+    for idx, a in enumerate(atoms):
+        sym = a["symbol"].upper()
+        imp_h = int(a.get("implicit_h") or 0)
+        chg = int(a.get("charge") or 0)
+        is_arom = bool(a.get("aromatic", False))
+        nbs = adj.get(idx, [])
+
+        if sym in {"N", "O"} and imp_h > 0:
+            hbd += imp_h
+        if sym in {"N", "O"}:
+            hba += 1
+
+        # Ertl group contributions to TPSA (in A^2)
+        if sym == "O":
+            if imp_h >= 1:
+                tpsa += 20.23
+            elif chg < 0:
+                tpsa += 23.06
+            elif any(order == 2 for _, order in nbs):
+                tpsa += 17.07
+            else:
+                tpsa += 9.23
+        elif sym == "N":
+            if chg > 0 and imp_h >= 3:
+                tpsa += 27.64
+            elif imp_h >= 2:
+                tpsa += 26.02
+            elif imp_h == 1:
+                tpsa += 12.03 if not is_arom else 15.79
+            else:
+                tpsa += 12.36 if is_arom else 3.24
+        elif sym == "S":
+            if imp_h >= 1:
+                tpsa += 38.80
+            elif any(order == 2 for _, order in nbs):
+                tpsa += 17.07
+            else:
+                tpsa += 25.30
+        elif sym == "P":
+            tpsa += 9.81
+
+        # Wildman-Crippen atomic LogP contributions
+        if sym == "C":
+            has_het_nb = any(atoms[nb]["symbol"].upper() in {"N", "O", "S", "F", "CL", "BR", "I"} for nb, _ in nbs if 0 <= nb < len(atoms))
+            if is_arom:
+                logp += 0.295 if not has_het_nb else 0.158
+            else:
+                logp += (0.144 + 0.123 * imp_h) if not has_het_nb else (-0.042 + 0.080 * imp_h)
+        elif sym == "O":
+            logp += -0.289 if imp_h >= 1 else (-0.150 if any(order == 2 for _, order in nbs) else -0.112)
+        elif sym == "N":
+            logp += -0.520 if imp_h >= 1 else -0.310
+        elif sym == "S":
+            logp += 0.210
+        elif sym == "F":
+            logp += 0.420
+        elif sym == "CL":
+            logp += 0.680
+        elif sym == "BR":
+            logp += 0.840
+        elif sym == "I":
+            logp += 1.120
+
+    tpsa = round(tpsa, 2)
+    logp = round(logp, 2)
+
+    violations = 0
+    if mw > 500.0:
+        violations += 1
+    if logp > 5.0:
+        violations += 1
+    if hbd > 5:
+        violations += 1
+    if hba > 10:
+        violations += 1
+
+    lipinski_pass = violations <= 1
+    veber_pass = (rot_bonds <= 10) and (tpsa <= 140.0)
+
+    # Quantitative Estimate of Drug-likeness (QED) smooth desirability score (0.0 to 1.0)
+    d_mw = math.exp(-((mw - 320.0) / 180.0) ** 2) if 120.0 <= mw <= 500.0 else 0.45
+    d_logp = math.exp(-((logp - 2.5) / 2.5) ** 2)
+    d_tpsa = math.exp(-((tpsa - 65.0) / 60.0) ** 2)
+    d_rot = 1.0 if rot_bonds <= 8 else max(0.2, 1.0 - 0.08 * (rot_bonds - 8))
+    qed_proxy = round(float((d_mw * d_logp * d_tpsa * d_rot) ** 0.25), 3)
+
+    return {
+        "Ligand": name,
+        "Molecular_Weight_Da": round(mw, 2),
+        "LogP_Crippen": logp,
+        "TPSA_A2": tpsa,
+        "HBD_Count": hbd,
+        "HBA_Count": hba,
+        "Rotatable_Bonds": rot_bonds,
+        "Heavy_Atom_Count": heavy_count,
+        "Ring_Count": ring_count,
+        "Lipinski_Violations": violations,
+        "Lipinski_Rule_of_5_Pass": lipinski_pass,
+        "Veber_Oral_Pass": veber_pass,
+        "QED_DrugLikeness_Score": qed_proxy,
+        "Plain_Chinese_Summary": (
+            f"符合类药五原则 (QED={qed_proxy})" if (lipinski_pass and veber_pass) else f"存在 {violations} 项越界需关注口服吸收"
+        ),
+    }

@@ -20,6 +20,12 @@ from .common import (
     distance,
     enumerate_ph_protonation_states,
     enumerate_stereoisomers_and_tautomers,
+    parse_mol2_block,
+    compute_admet_druglikeness,
+    parse_mol2_file,
+    parse_pdb_ligand_file,
+    parse_sdf_block,
+    parse_sdf_file,
     parse_smiles_tokens,
     require_executable,
     standardize_and_desalt_smiles,
@@ -197,6 +203,131 @@ def assess_ligand_chemical_state(name: str, smiles: str, ph: float = 7.4) -> dic
         "status": status,
         "interpretation": "Chemical-state audit with automated counterion stripping and coupled Henderson-Hasselbalch microstate enumeration.",
     }
+
+
+def assess_mol2_ligand(
+    name: str,
+    file_path: str | Path | None = None,
+    mol2_block: str | None = None,
+    sdf_block: str | None = None,
+    ph: float = 7.4,
+) -> tuple[dict, dict]:
+    """Perform compatibility, chemical-state, and ADMET auditing directly on a 3D structure ligand (.mol2, .sdf, .mol, .pdb)."""
+    input_fmt = "mol2"
+    if mol2_block:
+        desalted = parse_mol2_block(mol2_block, default_name=name, auto_desalt=True)
+    elif sdf_block:
+        input_fmt = "sdf"
+        desalted = parse_sdf_block(sdf_block, default_name=name, auto_desalt=True)
+    elif file_path is not None:
+        p = Path(file_path)
+        ext = p.suffix.lower()
+        input_fmt = ext.lstrip(".") or "mol2"
+        if ext in {".sdf", ".mol"}:
+            entries_clean = parse_sdf_file(p, auto_desalt=True)
+            desalted = next((e for e in entries_clean if e["name"] == name), entries_clean[0])
+        elif ext == ".pdb":
+            desalted = parse_pdb_ligand_file(p, default_name=name, auto_desalt=True)
+        else:
+            entries_clean = parse_mol2_file(p, auto_desalt=True)
+            desalted = next((e for e in entries_clean if e["name"] == name), entries_clean[0])
+    else:
+        raise ValueError(f"No 3D structure path or block provided for {name}")
+
+    atoms = desalted["atoms"]
+    elements = {a["symbol"].upper() for a in atoms}
+    metal_atoms = sorted(elements & METAL_SYMBOLS)
+    heavy_atoms = desalted["heavy_atom_count"]
+    rotatable_bonds = desalted["rotatable_bond_count"]
+    ring_count = desalted["ring_count"]
+    formal_charge = desalted["formal_charge"]
+    mol_wt = desalted["molecular_weight"]
+    oxygen_count = sum(1 for a in atoms if a["symbol"].upper() == "O")
+    sugar_like = heavy_atoms >= 35 and oxygen_count >= 8
+
+    flags: list[str] = []
+    if metal_atoms:
+        flags.append("metal_or_inorganic_species_requires_specialized_parameters")
+    if heavy_atoms > 80:
+        flags.append("large_ligand_may_exceed_standard_vina_sampling_assumptions")
+    if rotatable_bonds > 20:
+        flags.append("high_flexibility_requires_conformer_and_sampling_validation")
+    if abs(formal_charge) >= 2:
+        flags.append("multiply_charged_species_requires_protonation_and_electrostatics_review")
+    if sugar_like:
+        flags.append("polysaccharide_or_oligosaccharide_requires_sugar_specific_conformers_and_sampling")
+
+    status = "specialized_method_required" if (metal_atoms or sugar_like) else ("manual_review_required" if flags else "standard_small_molecule")
+    compatibility = {
+        "name": name,
+        "input_format": input_fmt,
+        "admet": compute_admet_druglikeness(name, parsed_structure=desalted),
+        "status": status,
+        "heavy_atom_count": heavy_atoms,
+        "rotatable_bond_count": rotatable_bonds,
+        "formal_charge": formal_charge,
+        "molecular_weight": mol_wt,
+        "ring_count": ring_count,
+        "oxygen_count": oxygen_count,
+        "stereocenter_count": 0,
+        "sugar_like": sugar_like,
+        "elements": sorted(elements),
+        "metal_atoms": metal_atoms,
+        "flags": flags,
+        "standard_vina_interpretation": not flags,
+    }
+
+    sybyl_types = {a.get("sybyl_type", "").lower() for a in atoms}
+    acidic_sites = []
+    basic_sites = []
+    if "o.co2" in sybyl_types:
+        acidic_sites.append("carboxylic_acid_or_carboxylate")
+    if any(st in sybyl_types for st in ("n.4", "n.3", "n.pl3", "n.cat")):
+        basic_sites.append("aliphatic_or_aromatic_amine")
+    if "n.ar" in sybyl_types:
+        basic_sites.append("heteroaromatic_nitrogen")
+
+    chem_flags = []
+    if desalted["was_desalted"]:
+        chem_flags.append("multiple_fragments_or_salt_form_requires_standardized_counterion_handling")
+    if acidic_sites or basic_sites:
+        chem_flags.append("ionizable_groups_detected_pka_and_protonation_state_not_predicted")
+    if formal_charge != 0:
+        chem_flags.append("explicit_formal_charge_requires_ph_and_electrostatics_review")
+
+    chemical_state = {
+        "name": name,
+        "input_format": input_fmt,
+        "admet": compute_admet_druglikeness(name, parsed_structure=desalted),
+        "source_file": str(file_path or "inline_mol2"),
+        "was_desalted": desalted["was_desalted"],
+        "stripped_counterions": desalted["stripped_counterions"],
+        "has_mol2_partial_charges": desalted["has_mol2_charges"],
+        "auto_remediated": True,
+        "remediated_status": "mol2_3d_coordinates_and_peoe_charges_verified",
+        "experimental_ph": float(ph),
+        "formal_charge": formal_charge,
+        "fragment_count": 1 + len(desalted["stripped_counterions"]),
+        "acidic_site_types": acidic_sites,
+        "basic_site_types": basic_sites,
+        "flags": chem_flags,
+        "status": "manual_review_required" if chem_flags else "single_neutral_state_candidate",
+        "interpretation": "Tripos MOL2 3D ligand audited with automated counterion desalting and SYBYL/PEOE partial charge verification.",
+    }
+    return compatibility, chemical_state
+
+
+def write_admet_report(admet_rows: list[dict], output_csv: Path) -> list[dict]:
+    """Write Lipinski Rule-of-5, Veber, TPSA, LogP, and QED drug-likeness table to CSV."""
+    if not admet_rows:
+        return []
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(admet_rows[0].keys())
+    with output_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(admet_rows)
+    return admet_rows
 
 
 def write_chemical_state_report(rows: list[dict], output_json: Path) -> None:

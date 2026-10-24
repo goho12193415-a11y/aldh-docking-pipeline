@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -22,14 +23,60 @@ from src.common import atom_dict, distance
 from src.mechanism_templates import list_supported_mechanisms
 
 
+def _canvas_sketch_line(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    color: str = "#2B2520",
+    width: int = 2,
+    seed: int = 1,
+    dash: tuple[int, ...] | None = None,
+) -> None:
+    """Draw a hand-sketched fountain-pen stroke using two slightly jittered passes."""
+    mx = (x1 + x2) * 0.5 + math.sin(seed * 7.13) * 1.5
+    my = (y1 + y2) * 0.5 + math.cos(seed * 5.31) * 1.5
+    kwargs = {"fill": color, "width": width, "smooth": True, "capstyle": "round"}
+    if dash:
+        kwargs["dash"] = dash
+    canvas.create_line(x1, y1, mx, my, x2, y2, **kwargs)
+    if not dash:
+        canvas.create_line(
+            x1 + 0.6, y1 - 0.5,
+            mx - 0.8, my + 0.7,
+            x2 - 0.5, y2 + 0.5,
+            fill=color, width=max(1, width - 1), smooth=True, capstyle="round",
+        )
+
+
+def _canvas_sketch_box(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    fill: str = "#FBF8F1",
+    outline: str = "#2B2520",
+    width: int = 2,
+    seed: int = 10,
+) -> None:
+    """Draw a hand-illustrated notebook card with subtle corner over-strokes."""
+    canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+    _canvas_sketch_line(canvas, x1 - 2, y1, x2 + 2, y1, outline, width, seed + 1)
+    _canvas_sketch_line(canvas, x2, y1 - 2, x2, y2 + 2, outline, width, seed + 2)
+    _canvas_sketch_line(canvas, x2 + 2, y2, x1 - 2, y2, outline, width, seed + 3)
+    _canvas_sketch_line(canvas, x1, y2 + 2, x1, y1 - 2, outline, width, seed + 4)
+
+
 class Interactive3DPocketWindow(tk.Toplevel):
-    """Pure-Tkinter interactive 3D molecular active-site & docking box viewer with mouse drag rotation and zoom."""
+    """Hand-drawn parchment-and-ink 3D molecular active-site sketchbook viewer (钢笔淡彩 / 炭铅素描三维速写台)."""
 
     def __init__(self, master: tk.Misc, complex_pdb: Path, box_audit_json: Path | None, catalytic_num: int = 302) -> None:
         super().__init__(master)
-        self.title(f"三维交互式活性口袋与 Docking Box 视图 — {complex_pdb.name}")
-        self.geometry("940x700")
-        self.configure(bg="#0B1320")
+        self.title(f"活性口袋三维钢笔速写稿 — {complex_pdb.name}")
+        self.geometry("960x720")
+        self.configure(bg="#F4EFE0")
 
         self.yaw = 0.45
         self.pitch = 0.30
@@ -38,6 +85,7 @@ class Interactive3DPocketWindow(tk.Toplevel):
         self.show_box_var = tk.BooleanVar(value=True)
         self.show_pocket_var = tk.BooleanVar(value=True)
         self.show_hbonds_var = tk.BooleanVar(value=True)
+        self.wash_mode_var = tk.BooleanVar(value=True)
 
         self.lig_atoms: list[dict] = []
         self.cat_atoms: list[dict] = []
@@ -48,7 +96,7 @@ class Interactive3DPocketWindow(tk.Toplevel):
 
         self._load_structure(complex_pdb, box_audit_json, catalytic_num)
         self._build_controls()
-        self.canvas = tk.Canvas(self, bg="#0B1320", highlightthickness=0, cursor="fleur")
+        self.canvas = tk.Canvas(self, bg="#F4EFE0", highlightthickness=0, cursor="fleur")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -84,7 +132,6 @@ class Interactive3DPocketWindow(tk.Toplevel):
             a for a in all_receptor
             if distance(a["coord"], self.center) <= 6.2 and a["name"] in {"CA", "CB", "CG", "CD", "ND2", "OD1", "OE1", "SG", "OG", "NZ", "OH"}
         ]
-        # Keep nearest cofactor atoms within 10 A for clean rendering
         self.cof_atoms = [a for a in self.cof_atoms if distance(a["coord"], self.center) <= 10.5]
 
         if box_audit_json and box_audit_json.is_file():
@@ -95,19 +142,20 @@ class Interactive3DPocketWindow(tk.Toplevel):
                 self.box_info = None
 
     def _build_controls(self) -> None:
-        bar = tk.Frame(self, bg="#132238", padx=14, pady=8)
+        bar = tk.Frame(self, bg="#EAE1CD", padx=14, pady=8, highlightbackground="#2B2520", highlightthickness=1)
         bar.pack(fill="x")
         tk.Label(
             bar,
-            text="鼠标左键拖拽旋转 3D 视角 | 滚轮缩放 | 青色: 配体(LIG)  品红: 催化残基  金色: 辅因子/金属  橙色虚线: 氢键/亲核距离",
-            bg="#132238",
-            fg="#DCE9F5",
-            font=("Segoe UI", 9, "bold"),
+            text="按住左键旋转速写视角 · 滚轮缩放  |  靛蓝: 配体(LIG)   朱砂: 催化残基   赭石: 辅因子/金属   炭铅: 口袋骨架",
+            bg="#EAE1CD",
+            fg="#2B2520",
+            font=("Georgia", 10, "bold"),
         ).pack(side="left")
-        tk.Button(bar, text="重置视角", command=self._reset_view, bg="#2F80ED", fg="#FFFFFF", relief="flat", padx=10).pack(side="right", padx=4)
-        tk.Checkbutton(bar, text="显示 Docking Box", variable=self.show_box_var, command=self._redraw, bg="#132238", fg="#FFFFFF", selectcolor="#10233F").pack(side="right", padx=6)
-        tk.Checkbutton(bar, text="显示氢键/催化距离", variable=self.show_hbonds_var, command=self._redraw, bg="#132238", fg="#FFFFFF", selectcolor="#10233F").pack(side="right", padx=6)
-        tk.Checkbutton(bar, text="显示口袋残基", variable=self.show_pocket_var, command=self._redraw, bg="#132238", fg="#FFFFFF", selectcolor="#10233F").pack(side="right", padx=6)
+        tk.Button(bar, text="归位视角", command=self._reset_view, bg="#FBF8F1", fg="#2B2520", relief="solid", bd=1, padx=10).pack(side="right", padx=4)
+        tk.Checkbutton(bar, text="淡彩上色", variable=self.wash_mode_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Checkbutton(bar, text="尺规 Box", variable=self.show_box_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Checkbutton(bar, text="距离批注", variable=self.show_hbonds_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
+        tk.Checkbutton(bar, text="口袋残基", variable=self.show_pocket_var, command=self._redraw, bg="#EAE1CD", fg="#2B2520", selectcolor="#FBF8F1").pack(side="right", padx=6)
 
     def _reset_view(self) -> None:
         self.yaw = 0.45
@@ -152,7 +200,17 @@ class Interactive3DPocketWindow(tk.Toplevel):
         w = max(400, self.canvas.winfo_width())
         h = max(300, self.canvas.winfo_height())
 
-        # 1. Draw Docking Box wireframe cube if enabled
+        # Draw faint notebook millimeter grid & hand-sketched frame border
+        for gx in range(28, w, 28):
+            self.canvas.create_line(gx, 0, gx, h, fill="#E5DEC9", width=1)
+        for gy in range(28, h, 28):
+            self.canvas.create_line(0, gy, w, gy, fill="#E5DEC9", width=1)
+        _canvas_sketch_line(self.canvas, 14, 14, w - 14, 14, "#2B2520", 2, 1)
+        _canvas_sketch_line(self.canvas, w - 14, 14, w - 14, h - 14, "#2B2520", 2, 2)
+        _canvas_sketch_line(self.canvas, w - 14, h - 14, 14, h - 14, "#2B2520", 2, 3)
+        _canvas_sketch_line(self.canvas, 14, h - 14, 14, 14, "#2B2520", 2, 4)
+        self.canvas.create_text(26, h - 26, text="Plate I — 活性口袋三维钢笔淡彩速写", anchor="w", fill="#655B4E", font=("Georgia", 10, "italic"))
+
         if self.show_box_var.get() and self.box_info:
             bx, by, bz = self.box_info.get("center_x", 0.0), self.box_info.get("center_y", 0.0), self.box_info.get("center_z", 0.0)
             hx = self.box_info.get("size_x", 18.0) * 0.5
@@ -167,25 +225,23 @@ class Interactive3DPocketWindow(tk.Toplevel):
                 (0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
                 (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7),
             ]
-            for i, j in edges:
-                self.canvas.create_line(proj_c[i][0], proj_c[i][1], proj_c[j][0], proj_c[j][1], fill="#2B4C7E", width=1, dash=(4, 4))
+            for idx_e, (i, j) in enumerate(edges):
+                _canvas_sketch_line(self.canvas, proj_c[i][0], proj_c[i][1], proj_c[j][0], proj_c[j][1], "#8C7F6B", 1, idx_e + 20, dash=(4, 4))
 
-        # 2. Draw bonds within groups
-        def _draw_group_bonds(atoms: list[dict], color: str, width: int, cutoff: float = 1.95) -> None:
+        def _draw_group_bonds(atoms: list[dict], color: str, width: int, cutoff: float = 1.95, seed_base: int = 100) -> None:
             for i in range(len(atoms)):
                 for j in range(i + 1, len(atoms)):
                     if distance(atoms[i]["coord"], atoms[j]["coord"]) <= cutoff:
                         x1, y1, _ = self._project(atoms[i]["coord"], w, h)
                         x2, y2, _ = self._project(atoms[j]["coord"], w, h)
-                        self.canvas.create_line(x1, y1, x2, y2, fill=color, width=width)
+                        _canvas_sketch_line(self.canvas, x1, y1, x2, y2, color, width, seed_base + i * 17 + j)
 
         if self.show_pocket_var.get():
-            _draw_group_bonds(self.pocket_atoms, "#4A607A", 2, cutoff=1.9)
-        _draw_group_bonds(self.cof_atoms, "#D4AC0D", 3, cutoff=1.85)
-        _draw_group_bonds(self.cat_atoms, "#E91E63", 3, cutoff=1.95)
-        _draw_group_bonds(self.lig_atoms, "#00E5FF", 4, cutoff=1.85)
+            _draw_group_bonds(self.pocket_atoms, "#7A7062", 2, cutoff=1.9, seed_base=100)
+        _draw_group_bonds(self.cof_atoms, "#9C6B21", 2, cutoff=1.85, seed_base=300)
+        _draw_group_bonds(self.cat_atoms, "#A8382B", 3, cutoff=1.95, seed_base=500)
+        _draw_group_bonds(self.lig_atoms, "#2B2520", 3, cutoff=1.85, seed_base=700)
 
-        # 3. Draw catalytic & H-bond dashed vectors
         if self.show_hbonds_var.get() and self.lig_atoms:
             for la in self.lig_atoms:
                 for ca in self.cat_atoms:
@@ -194,8 +250,8 @@ class Interactive3DPocketWindow(tk.Toplevel):
                         if d <= 5.0:
                             x1, y1, _ = self._project(la["coord"], w, h)
                             x2, y2, _ = self._project(ca["coord"], w, h)
-                            self.canvas.create_line(x1, y1, x2, y2, fill="#FF4081", width=2, dash=(5, 3))
-                            self.canvas.create_text((x1 + x2) * 0.5, (y1 + y2) * 0.5 - 8, text=f"d_nuc={d:.2f}Å", fill="#FF80AB", font=("Consolas", 9, "bold"))
+                            _canvas_sketch_line(self.canvas, x1, y1, x2, y2, "#A8382B", 2, 901, dash=(5, 3))
+                            self.canvas.create_text((x1 + x2) * 0.5, (y1 + y2) * 0.5 - 8, text=f"d_nuc = {d:.2f} Å", fill="#A8382B", font=("Georgia", 10, "bold italic"))
                 if la["element"].upper() in {"O", "N", "S"}:
                     for pa in self.pocket_atoms + self.cat_atoms + self.cof_atoms:
                         if pa["element"].upper() in {"O", "N", "S"}:
@@ -203,22 +259,21 @@ class Interactive3DPocketWindow(tk.Toplevel):
                             if 2.3 <= d <= 3.5:
                                 x1, y1, _ = self._project(la["coord"], w, h)
                                 x2, y2, _ = self._project(pa["coord"], w, h)
-                                self.canvas.create_line(x1, y1, x2, y2, fill="#FFA726", width=2, dash=(3, 3))
-                                self.canvas.create_text((x1 + x2) * 0.5, (y1 + y2) * 0.5 + 8, text=f"{d:.2f}Å", fill="#FFD54F", font=("Consolas", 8))
+                                _canvas_sketch_line(self.canvas, x1, y1, x2, y2, "#3D6349", 1, 950, dash=(3, 3))
+                                self.canvas.create_text((x1 + x2) * 0.5, (y1 + y2) * 0.5 + 8, text=f"{d:.2f} Å", fill="#3D6349", font=("Georgia", 8, "italic"))
 
-        # 4. Depth-sorted atom spheres
         render_queue = []
         if self.show_pocket_var.get():
             for a in self.pocket_atoms:
-                render_queue.append((a, "#78909C", 4, f"{a['resname']}{a['resseq']}" if a["name"] == "CA" else ""))
+                render_queue.append((a, "#D2C9B8", 4, f"{a['resname']}{a['resseq']}" if a["name"] == "CA" else ""))
         for a in self.cof_atoms:
-            render_queue.append((a, "#FFD54F", 5, f"{a['resname']}:{a['name']}" if a["name"] in {"C4N", "N5", "FE"} else ""))
+            render_queue.append((a, "#E6B86A", 6, f"{a['resname']}:{a['name']}" if a["name"] in {"C4N", "N5", "FE"} else ""))
         for a in self.cat_atoms:
-            render_queue.append((a, "#FF4081", 6, f"{a['resname']}{a['resseq']}:{a['name']}" if a["name"] in {"SG", "OG", "CA"} else ""))
+            render_queue.append((a, "#D97B6C", 7, f"{a['resname']}{a['resseq']}:{a['name']}" if a["name"] in {"SG", "OG", "CA"} else ""))
         for a in self.lig_atoms:
             el = a["element"].upper()
-            col = "#FF5252" if el == "O" else ("#448AFF" if el == "N" else "#00E5FF")
-            render_queue.append((a, col, 7, a["name"]))
+            col = "#DF7A6B" if el == "O" else ("#6D93B0" if el == "N" else "#5B7D95")
+            render_queue.append((a, col, 8, a["name"]))
 
         projected_atoms = []
         for atom, col, radius, label in render_queue:
@@ -226,33 +281,39 @@ class Interactive3DPocketWindow(tk.Toplevel):
             projected_atoms.append((z_depth, sx, sy, col, radius, label))
         projected_atoms.sort(key=lambda item: item[0])
 
+        wash = self.wash_mode_var.get()
         for _, sx, sy, col, radius, label in projected_atoms:
-            self.canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill=col, outline="#0B1320", width=1)
+            if wash:
+                self.canvas.create_oval(sx - radius + 1.5, sy - radius + 1.2, sx + radius + 1.5, sy + radius + 1.2, fill=col, outline="")
+            else:
+                self.canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill="#F4EFE0", outline="")
+            self.canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill="", outline="#2B2520", width=1.5)
+            self.canvas.create_arc(sx - radius * 0.7, sy - radius * 0.7, sx + radius * 0.7, sy + radius * 0.7, start=210, extent=110, style="arc", outline="#2B2520", width=1)
             if label:
-                self.canvas.create_text(sx + radius + 4, sy - 4, text=label, anchor="w", fill="#ECEFF1", font=("Segoe UI", 8))
+                self.canvas.create_text(sx + radius + 4, sy - 3, text=label, anchor="w", fill="#2B2520", font=("Georgia", 9))
 
 
 class DockingWorkbench(tk.Tk):
-    """Interactive 4-page scientific workbench for the Universal ALDH & Enzyme Docking Pipeline v6.0."""
+    """Interactive 4-page scientific workbench for the Universal ALDH & Enzyme Docking Pipeline v3.0."""
 
     COLORS = {
-        "navy": "#10233F",
-        "navy_2": "#173557",
-        "blue": "#2F80ED",
-        "cyan": "#35B8C8",
-        "green": "#2E9B68",
-        "amber": "#D88A28",
-        "red": "#C94C4C",
-        "ink": "#182433",
-        "muted": "#6C7A89",
-        "line": "#DCE4EC",
-        "paper": "#F4F7FA",
-        "white": "#FFFFFF",
+        "navy": "#2B2520",
+        "navy_2": "#423930",
+        "blue": "#2F4860",
+        "cyan": "#3D6349",
+        "green": "#3D6349",
+        "amber": "#B57B28",
+        "red": "#A8382B",
+        "ink": "#2B2520",
+        "muted": "#655B4E",
+        "line": "#D8CEB8",
+        "paper": "#F6F1E4",
+        "white": "#FBF8F1",
     }
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("通用酶与分子对接全自动工作台 v6.0")
+        self.title("分子对接与催化构象实验手札 · 手绘工作台")
         self.geometry("1260x820")
         self.minsize(1040, 680)
         self.process: subprocess.Popen[str] | None = None
@@ -311,15 +372,15 @@ class DockingWorkbench(tk.Tk):
         style.theme_use("clam")
         style.configure("TFrame", background=self.COLORS["paper"])
         style.configure("Card.TFrame", background=self.COLORS["white"])
-        style.configure("TLabel", background=self.COLORS["paper"], foreground=self.COLORS["ink"], font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background=self.COLORS["white"], foreground=self.COLORS["ink"], font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=self.COLORS["paper"], foreground=self.COLORS["muted"], font=("Segoe UI", 9))
-        style.configure("CardMuted.TLabel", background=self.COLORS["white"], foreground=self.COLORS["muted"], font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background=self.COLORS["paper"], foreground=self.COLORS["navy"], font=("Segoe UI", 20, "bold"))
-        style.configure("Section.TLabel", background=self.COLORS["white"], foreground=self.COLORS["navy"], font=("Segoe UI", 12, "bold"))
-        style.configure("Primary.TButton", background=self.COLORS["blue"], foreground=self.COLORS["white"], borderwidth=0, padding=(14, 8), font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background=self.COLORS["paper"], foreground=self.COLORS["ink"], font=("Georgia", 10))
+        style.configure("Card.TLabel", background=self.COLORS["white"], foreground=self.COLORS["ink"], font=("Georgia", 10))
+        style.configure("Muted.TLabel", background=self.COLORS["paper"], foreground=self.COLORS["muted"], font=("Georgia", 9))
+        style.configure("CardMuted.TLabel", background=self.COLORS["white"], foreground=self.COLORS["muted"], font=("Georgia", 9))
+        style.configure("Title.TLabel", background=self.COLORS["paper"], foreground=self.COLORS["navy"], font=("Georgia", 20, "bold"))
+        style.configure("Section.TLabel", background=self.COLORS["white"], foreground=self.COLORS["navy"], font=("Georgia", 12, "bold"))
+        style.configure("Primary.TButton", background=self.COLORS["blue"], foreground=self.COLORS["white"], borderwidth=0, padding=(14, 8), font=("Georgia", 10, "bold"))
         style.map("Primary.TButton", background=[("active", "#1E67C5")])
-        style.configure("Danger.TButton", background=self.COLORS["red"], foreground=self.COLORS["white"], borderwidth=0, padding=(12, 8), font=("Segoe UI", 10, "bold"))
+        style.configure("Danger.TButton", background=self.COLORS["red"], foreground=self.COLORS["white"], borderwidth=0, padding=(12, 8), font=("Georgia", 10, "bold"))
         style.configure("Secondary.TButton", background=self.COLORS["white"], foreground=self.COLORS["navy"], bordercolor=self.COLORS["line"], padding=(12, 8))
         style.configure("TEntry", fieldbackground=self.COLORS["white"], bordercolor=self.COLORS["line"], padding=6)
 
@@ -333,28 +394,28 @@ class DockingWorkbench(tk.Tk):
         sidebar = tk.Frame(self, bg=self.COLORS["navy"], width=230)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
-        tk.Label(sidebar, text="UNIVERSAL", bg=self.COLORS["navy"], fg=self.COLORS["white"], font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=24, pady=(26, 0))
-        tk.Label(sidebar, text="全自动分子对接工作台 v6.0", bg=self.COLORS["navy"], fg="#8FB5D8", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
+        tk.Label(sidebar, text="FOLIO", bg=self.COLORS["navy"], fg=self.COLORS["white"], font=("Georgia", 20, "bold")).pack(anchor="w", padx=24, pady=(26, 0))
+        tk.Label(sidebar, text="纸本钢笔淡彩 · 实验手札台", bg=self.COLORS["navy"], fg="#C9BFA8", font=("Georgia", 9, "bold")).pack(anchor="w", padx=24, pady=(0, 24))
         nav_items = [
-            ("quick", "01  快速实验"),
-            ("prep", "02  结构与化学准备"),
-            ("dock", "03  对接与矩阵参数"),
-            ("results", "04  结果表格与 3D 视图"),
+            ("quick", "卷一 · 标本入册"),
+            ("prep", "卷二 · 活性尺规"),
+            ("dock", "卷三 · 构象搜寻"),
+            ("results", "卷四 · 台账与速写"),
         ]
         for key, label in nav_items:
             frame = tk.Frame(sidebar, bg=self.COLORS["navy"], padx=18, pady=11, cursor="hand2")
             frame.pack(fill="x", padx=10, pady=2)
-            lbl = tk.Label(frame, text=label, bg=frame["bg"], fg="#C7D6E5", font=("Segoe UI", 10), cursor="hand2")
+            lbl = tk.Label(frame, text=label, bg=frame["bg"], fg="#E6DFCE", font=("Georgia", 10), cursor="hand2")
             lbl.pack(anchor="w")
             frame.bind("<Button-1>", lambda _e, k=key: self._switch_page(k))
             lbl.bind("<Button-1>", lambda _e, k=key: self._switch_page(k))
             self.nav_frames[key] = frame
             self.nav_labels[key] = lbl
 
-        tk.Frame(sidebar, bg="#28486A", height=1).pack(fill="x", padx=24, pady=22)
-        tk.Label(sidebar, text="当前项目目录", bg=self.COLORS["navy"], fg="#8FB5D8", font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=24)
-        tk.Label(sidebar, textvariable=self.root_var, wraplength=180, justify="left", bg=self.COLORS["navy"], fg="#DCE9F5", font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(6, 0))
-        tk.Label(sidebar, text="9大机制 / 3D-pKa / 物理重打分已启用", bg=self.COLORS["navy"], fg="#7BD6A7", font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(18, 0))
+        tk.Frame(sidebar, bg="#5C5042", height=1).pack(fill="x", padx=24, pady=22)
+        tk.Label(sidebar, text="当前项目目录", bg=self.COLORS["navy"], fg="#C9BFA8", font=("Georgia", 8, "bold")).pack(anchor="w", padx=24)
+        tk.Label(sidebar, textvariable=self.root_var, wraplength=180, justify="left", bg=self.COLORS["navy"], fg="#F6F1E4", font=("Georgia", 8)).pack(anchor="w", padx=24, pady=(6, 0))
+        tk.Label(sidebar, text="9大机制 / 3D-pKa / 物理重打分已启用", bg=self.COLORS["navy"], fg="#D8B372", font=("Georgia", 8)).pack(anchor="w", padx=24, pady=(18, 0))
 
     def _build_main(self) -> None:
         main = ttk.Frame(self, padding=(24, 20, 24, 16))
@@ -365,7 +426,7 @@ class DockingWorkbench(tk.Tk):
         header = ttk.Frame(main)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="通用机制引导型全自动分子对接工作台", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="分子对接与催化构象实验手札", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(header, text="覆盖 9 大酶与通用靶点家族、3D 微环境 pKa、侧链自动修复、物理化学能量重打分、L-BFGS-B 精修与交互式 3D 视图。", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
         btn_bar = ttk.Frame(header)
         btn_bar.grid(row=0, column=1, rowspan=2)
@@ -386,8 +447,8 @@ class DockingWorkbench(tk.Tk):
             tk.Frame(card, bg=color, width=5).pack(side="left", fill="y")
             inner = tk.Frame(card, bg=self.COLORS["white"], padx=11, pady=8)
             inner.pack(side="left", fill="both", expand=True)
-            tk.Label(inner, text=label, bg=self.COLORS["white"], fg=self.COLORS["muted"], font=("Segoe UI", 8, "bold")).pack(anchor="w")
-            tk.Label(inner, textvariable=value, bg=self.COLORS["white"], fg=self.COLORS["ink"], font=("Segoe UI", 9, "bold"), wraplength=210, justify="left").pack(anchor="w", pady=(2, 0))
+            tk.Label(inner, text=label, bg=self.COLORS["white"], fg=self.COLORS["muted"], font=("Georgia", 8, "bold")).pack(anchor="w")
+            tk.Label(inner, textvariable=value, bg=self.COLORS["white"], fg=self.COLORS["ink"], font=("Georgia", 9, "bold"), wraplength=210, justify="left").pack(anchor="w", pady=(2, 0))
 
         self.page_container = ttk.Frame(main)
         self.page_container.grid(row=2, column=0, sticky="ew")
@@ -417,8 +478,8 @@ class DockingWorkbench(tk.Tk):
         log_frame = ttk.Frame(lower, style="Card.TFrame", padding=10)
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
-        ttk.Label(log_frame, text="实时运行日志", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.log = tk.Text(log_frame, wrap="none", state="disabled", bg="#101B2B", fg="#D8E6F3", insertbackground="#FFFFFF", relief="flat", padx=12, pady=8, height=10, font=("Consolas", 9))
+        ttk.Label(log_frame, text="实验过程笔录", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.log = tk.Text(log_frame, wrap="none", state="disabled", bg="#FAF5E8", fg="#2B2520", insertbackground="#FFFFFF", relief="flat", padx=12, pady=8, height=10, font=("Consolas", 9))
         self.log.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         scroll.grid(row=1, column=1, sticky="ns")
@@ -431,15 +492,15 @@ class DockingWorkbench(tk.Tk):
     def _build_page_quick(self) -> None:
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         page.columnconfigure(1, weight=1)
-        ttk.Label(page, text="01  快速全自动实验（零配置向导）", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(page, text="选择任意受体 PDB 并输入配体（支持 名称=SMILES 或直接填英文名从 PubChem 自动拉取），程序自动识别位点/盲扫空腔并完成对接。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 12))
+        ttk.Label(page, text="卷一 · 标本入册（放入蛋白与配体标本）", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(page, text="支持同时选择多个受体 PDB，配体支持直接导入 .mol2 / .sdf 三维结构文件、CSV/SMI 表格或 名称=SMILES。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 12))
         ttk.Label(page, text="受体 PDB", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Entry(page, textvariable=self.quick_receptor_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=10)
-        ttk.Button(page, text="浏览 PDB", style="Secondary.TButton", command=self._choose_quick_receptor).grid(row=2, column=3)
+        ttk.Button(page, text="浏览 PDB(可多选)", style="Secondary.TButton", command=self._choose_quick_receptor).grid(row=2, column=3)
 
         ttk.Label(page, text="配体列表", style="Card.TLabel").grid(row=3, column=0, sticky="nw", pady=(10, 0))
         ttk.Entry(page, textvariable=self.quick_ligands_var).grid(row=3, column=1, sticky="ew", padx=10, pady=(10, 0))
-        ttk.Button(page, text="导入 CSV/SMI", style="Secondary.TButton", command=self._import_ligand_file).grid(row=3, column=2, padx=(0, 8), pady=(10, 0))
+        ttk.Button(page, text="导入 MOL2/SDF/CSV", style="Secondary.TButton", command=self._import_ligand_file).grid(row=3, column=2, padx=(0, 8), pady=(10, 0))
         ttk.Button(page, text="一键自动配置并运行", style="Primary.TButton", command=self._quick_run).grid(row=3, column=3, pady=(10, 0))
         self.pages["quick"] = page
 
@@ -447,7 +508,7 @@ class DockingWorkbench(tk.Tk):
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         for col in range(6):
             page.columnconfigure(col, weight=1)
-        ttk.Label(page, text="02  受体结构深度修复、3D-pKa 与 9 大机制设置", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(page, text="卷二 · 活性尺规（位点勘定与质子化微态）", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
         ttk.Label(page, text="支持 9 类酶与通用靶点机制，自动重建缺失侧链重原子、清理 AltLoc、探测桥联结晶水并预测口袋 3D 微环境 pKa。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
 
         ttk.Label(page, text="机制家族", style="Card.TLabel").grid(row=2, column=0, sticky="w")
@@ -487,7 +548,7 @@ class DockingWorkbench(tk.Tk):
         page = ttk.Frame(self.page_container, style="Card.TFrame", padding=18)
         for col in range(6):
             page.columnconfigure(col, weight=1)
-        ttk.Label(page, text="03  Docking Box、空腔自动发现与多维共识参数", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(page, text="卷三 · 构象搜寻（活性腔体尺规与采样精度）", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
         ttk.Label(page, text="支持已知位点聚焦与无先验全蛋白 3D 空腔扫描（盲对接），内置物理化学能量重打分与 L-BFGS-B 局部精修。", style="CardMuted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 12))
 
         ttk.Label(page, text="Box 尺寸 X/Y/Z (Å)", style="Card.TLabel").grid(row=2, column=0, sticky="w")
@@ -523,20 +584,22 @@ class DockingWorkbench(tk.Tk):
         header_row = ttk.Frame(page, style="Card.TFrame")
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header_row.columnconfigure(0, weight=1)
-        ttk.Label(header_row, text="04  对接结果、物理化学重打分、Borda 共识秩与 3D 交互预览", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header_row, text="卷四 · 实验台账与三维钢笔速写", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         btn_box = ttk.Frame(header_row, style="Card.TFrame")
         btn_box.grid(row=0, column=1, sticky="e")
-        ttk.Button(btn_box, text="打开三维交互式口袋/Box 视图", style="Primary.TButton", command=self._open_interactive_3d_viewer).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_box, text="展阅手绘实验手札(HTML)", style="Primary.TButton", command=self._open_html_report).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_box, text="开启三维钢笔速写台", style="Secondary.TButton", command=self._open_interactive_3d_viewer).pack(side="left", padx=(0, 6))
         ttk.Button(btn_box, text="预览 300DPI 渲染图", style="Secondary.TButton", command=self._preview_selected_figure).pack(side="left", padx=(0, 6))
         ttk.Button(btn_box, text="查看 14 项系统覆盖矩阵", style="Secondary.TButton", command=self._show_coverage_dialog).pack(side="left")
 
         columns = (
-            "Ligand", "Mode", "Binding_Affinity_kcal_mol", "PhysChem_Score_kcal_mol",
+            "Receptor", "Ligand", "Mode", "Binding_Affinity_kcal_mol", "PhysChem_Score_kcal_mol",
             "Universal_Consensus_Rank", "d_nuc_A", "d_hyd_A", "d_oxy_asn_A",
             "Catalytic_Geometry_Score", "Catalytically_Competent", "Reliability_Grade",
         )
         tree = ttk.Treeview(page, columns=columns, show="headings", height=5)
         headings = {
+            "Receptor": "受体",
             "Ligand": "配体",
             "Mode": "构象",
             "Binding_Affinity_kcal_mol": "Vina(kcal/mol)",
@@ -556,17 +619,28 @@ class DockingWorkbench(tk.Tk):
         self.results_tree = tree
         self.pages["results"] = page
 
+    def _open_html_report(self) -> None:
+        root = Path(self.root_var.get())
+        cn_html = root / "reports" / "对接结果可视化总览报告.html"
+        en_html = root / "reports" / "visual_summary_report.html"
+        target = cn_html if cn_html.is_file() else en_html
+        if not target.is_file():
+            messagebox.showinfo("提示", "尚未生成可视化 HTML 报告，请先运行一次对接。")
+            return
+        webbrowser.open(target.resolve().as_uri())
+
     def _open_interactive_3d_viewer(self) -> None:
         selected = self.results_tree.selection() if self.results_tree else ()
         ligand = None
         if selected and self.results_tree:
             values = self.results_tree.item(selected[0], "values")
             if values:
-                ligand = str(values[0])
+                ligand = str(values[1]) if len(values) > 1 and self.results_tree["columns"][0] == "Receptor" else str(values[0])
         if not ligand and self.results_tree:
             children = self.results_tree.get_children()
             if children:
-                ligand = str(self.results_tree.item(children[0], "values")[0])
+                vals0 = self.results_tree.item(children[0], "values")
+                ligand = str(vals0[1]) if len(vals0) > 1 and self.results_tree["columns"][0] == "Receptor" else str(vals0[0])
         if not ligand:
             messagebox.showinfo("提示", "请先运行对接并选择一条配体结果。")
             return
@@ -591,7 +665,7 @@ class DockingWorkbench(tk.Tk):
             bg = self.COLORS["navy_2"] if active else self.COLORS["navy"]
             fg = self.COLORS["white"] if active else "#C7D6E5"
             nav_frame.configure(bg=bg)
-            self.nav_labels[key].configure(bg=bg, fg=fg, font=("Segoe UI", 10, "bold" if active else "normal"))
+            self.nav_labels[key].configure(bg=bg, fg=fg, font=("Georgia", 10, "bold" if active else "normal"))
         if page_key == "results":
             self._refresh_results()
 
@@ -708,22 +782,61 @@ class DockingWorkbench(tk.Tk):
         )
 
     def _choose_quick_receptor(self) -> None:
-        selected = filedialog.askopenfilename(
+        selected = filedialog.askopenfilenames(
             initialdir=str(Path(self.root_var.get()) / "data" / "01_raw_receptors"),
-            filetypes=[("PDB structure", "*.pdb"), ("All files", "*.*")],
+            title="选择一个或多个受体 PDB 文件（支持多选）",
+            filetypes=[("蛋白质结构 .pdb / .cif (支持多选)", "*.pdb *.cif *.mmcif"), ("All files", "*.*")],
         )
         if selected:
-            self.quick_receptor_var.set(selected)
+            self.quick_receptor_var.set("; ".join(selected))
+            self._append(f"[INFO] 已选择 {len(selected)} 个受体 PDB 文件。\n")
 
     def _import_ligand_file(self) -> None:
-        selected = filedialog.askopenfilename(
+        selected_files = filedialog.askopenfilenames(
             initialdir=str(Path(self.root_var.get()) / "data"),
-            filetypes=[("Ligand files", "*.csv *.smi *.txt"), ("All files", "*.*")],
+            title="选择配体文件（支持多选 .mol2 / .sdf / .pdbqt / .csv / .smi）",
+            filetypes=[
+                ("所有支持的配体格式 (.mol2/.sdf/.pdbqt/.csv/.smi)", "*.mol2 *.sdf *.mol *.pdb *.pdbqt *.csv *.smi *.txt"),
+                ("Tripos MOL2 3D 配体 (*.mol2)", "*.mol2"),
+                ("SDF/MOL/PDBQT 3D 配体", "*.sdf *.mol *.pdbqt"),
+                ("SMILES / CSV 列表", "*.csv *.smi *.txt"),
+                ("All files", "*.*"),
+            ],
         )
-        if not selected:
+        if not selected_files:
             return
-        path = Path(selected)
         entries = []
+        for selected in selected_files:
+            path = Path(selected)
+            ext = path.suffix.lower()
+            if ext in {".mol2", ".sdf", ".mol", ".pdb", ".pdbqt"}:
+                entries.append(f"{path.stem}={path}")
+                continue
+            if ext == ".csv":
+                with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+                    for row in csv.DictReader(handle):
+                        n = (row.get("name") or row.get("Name") or row.get("Ligand") or "").strip()
+                        s = (row.get("mol2") or row.get("MOL2") or row.get("file") or row.get("smiles") or row.get("SMILES") or "").strip()
+                        if n and s:
+                            entries.append(f"{n}={s}")
+            else:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    t = line.strip()
+                    if not t or t.startswith("#"):
+                        continue
+                    if "=" in t:
+                        entries.append(t)
+                    else:
+                        parts = t.split()
+                        if len(parts) >= 2:
+                            entries.append(f"{parts[1]}={parts[0]}")
+                        elif len(parts) == 1 and parts[0].lower().endswith((".mol2", ".sdf", ".mol", ".pdbqt")):
+                            entries.append(f"{Path(parts[0]).stem}={parts[0]}")
+        if entries:
+            self.quick_ligands_var.set("; ".join(entries))
+            self._append(f"[INFO] 已成功导入 {len(entries)} 个配体（支持 .mol2 / SMILES）。\n")
+            return
+        path = Path(selected_files[0])
         if path.suffix.lower() == ".csv":
             with path.open(newline="", encoding="utf-8", errors="replace") as handle:
                 for row in csv.DictReader(handle):
@@ -876,11 +989,12 @@ class DockingWorkbench(tk.Tk):
         if selected:
             values = self.results_tree.item(selected[0], "values")
             if values:
-                ligand = str(values[0])
+                ligand = str(values[1]) if len(values) > 1 and self.results_tree["columns"][0] == "Receptor" else str(values[0])
         if not ligand:
             children = self.results_tree.get_children()
             if children:
-                ligand = str(self.results_tree.item(children[0], "values")[0])
+                vals0 = self.results_tree.item(children[0], "values")
+                ligand = str(vals0[1]) if len(vals0) > 1 and self.results_tree["columns"][0] == "Receptor" else str(vals0[0])
         if not ligand:
             messagebox.showinfo("提示", "请先运行对接并选择一条配体结果。")
             return
@@ -913,7 +1027,7 @@ class DockingWorkbench(tk.Tk):
             return
         data = json.loads(cov_path.read_text(encoding="utf-8"))
         top = tk.Toplevel(self)
-        top.title("16 项全流程自动化覆盖矩阵 (v6.0)")
+        top.title("14 项全流程自动化覆盖矩阵 (v3.0)")
         top.geometry("780x460")
         tree = ttk.Treeview(top, columns=("item", "status", "external"), show="headings")
         tree.heading("item", text="模块项")

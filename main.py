@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from src.common import configure_logging, estimate_receptor_microenvironment_pka, require_executable, resolve_path
+from src.common import compute_admet_druglikeness, configure_logging, estimate_receptor_microenvironment_pka, require_executable, resolve_path
 from src.mechanism_templates import load_mechanism_template, mechanism_capability
 from src.step10_evaluation import evaluate_experimental_data
 from src.step1_ligand_prep import (
@@ -34,6 +34,7 @@ from src.step7_advanced import (
     assess_enzyme_readiness,
     assess_ligand_chemical_state,
     assess_ligand_compatibility,
+    assess_mol2_ligand,
     assess_structure_quality,
     audit_docking_box,
     audit_receptor_state,
@@ -44,6 +45,7 @@ from src.step7_advanced import (
     enforce_capability_gate,
     evaluate_redocking_control,
     run_optional_plip,
+    write_admet_report,
     write_chemical_state_report,
     write_conformer_summary,
     write_ligand_compatibility_report,
@@ -60,11 +62,56 @@ from src.system_upgrade import (
     build_flexible_receptor_plan,
     build_multi_box_plan,
     build_workflow_readiness,
+    generate_visual_html_report,
     write_system_coverage_report,
 )
 
 LOGGER = logging.getLogger("main")
 _SUMMARY_LOCK = threading.Lock()
+
+
+def discover_raw_receptors(project_root: Path, config: dict, cli_receptors: list[str] | None = None) -> list[Path]:
+    """Resolve one or multiple receptor PDB files from CLI, config (input_pdb / input_pdbs), data/01_raw_receptors/*.pdb, and receptor_ensemble."""
+    rec_cfg = config.get("receptor", {})
+    candidates: list[str] = []
+    if cli_receptors:
+        for item in cli_receptors:
+            for part in str(item).split(";"):
+                if part.strip():
+                    candidates.append(part.strip())
+    if isinstance(rec_cfg.get("input_pdbs"), list):
+        for item in rec_cfg["input_pdbs"]:
+            if str(item).strip():
+                candidates.append(str(item).strip())
+    raw_in = rec_cfg.get("input_pdb")
+    if isinstance(raw_in, list):
+        for item in raw_in:
+            if str(item).strip():
+                candidates.append(str(item).strip())
+    elif raw_in:
+        for part in str(raw_in).split(";"):
+            if part.strip():
+                candidates.append(part.strip())
+
+    resolved_list: list[Path] = []
+    for c_str in candidates:
+        p = resolve_path(project_root, c_str)
+        if p not in resolved_list:
+            resolved_list.append(p)
+
+    raw_dir = project_root / "data" / "01_raw_receptors"
+    if rec_cfg.get("auto_discover_receptors", True) and raw_dir.is_dir():
+        for pdb_file in sorted(list(raw_dir.glob("*.pdb")) + list(raw_dir.glob("*.cif")) + list(raw_dir.glob("*.mmcif"))):
+            if pdb_file not in resolved_list:
+                resolved_list.append(pdb_file)
+
+    ens_inputs = config.get("advanced", {}).get("receptor_ensemble", {}).get("inputs", []) or []
+    for ens_in in ens_inputs:
+        p = resolve_path(project_root, ens_in)
+        if p not in resolved_list:
+            resolved_list.append(p)
+
+    return resolved_list
 
 
 def load_config(path: Path) -> dict:
@@ -145,11 +192,21 @@ def run(
     allow_specialized: bool = False,
     use_cache: bool = True,
     max_workers: int | None = None,
+    cli_receptors: list[str] | None = None,
+    cli_ligands: list[str] | None = None,
 ) -> None:
     root = config_path.parent.parent
     config = load_config(config_path)
     configure_logging(config["project"].get("log_level", "INFO"))
-    receptor_input = resolve_path(root, config["receptor"]["input_pdb"])
+    all_receptors = discover_raw_receptors(root, config, cli_receptors=cli_receptors)
+    if not all_receptors:
+        raise FileNotFoundError("No receptor PDB found in config or data/01_raw_receptors/.")
+    receptor_input = all_receptors[0]
+    config["receptor"]["input_pdb"] = str(receptor_input)
+    if len(all_receptors) > 1:
+        ens_cfg = config.setdefault("advanced", {}).setdefault("receptor_ensemble", {})
+        ens_cfg["enabled"] = True
+        ens_cfg["inputs"] = [str(p) for p in all_receptors[1:]]
     receptor_out = root / "data" / "03_prepped_receptors"
     advanced = config.get("advanced", {})
     safety_cfg = config.get("safety", {})
@@ -158,7 +215,23 @@ def run(
     experimental_ph = float(safety_cfg.get("experimental_ph", 7.4))
     workers = max(1, int(max_workers or config["project"].get("max_workers", 1)))
 
-    config["ligands"] = discover_raw_ligands(root / "data" / "02_raw_ligands", config.get("ligands", []))
+    configured_ligs = list(config.get("ligands", []) or [])
+    for cli_lig in cli_ligands or []:
+        for part in str(cli_lig).split(";"):
+            tok = part.strip()
+            if not tok:
+                continue
+            if "=" in tok:
+                k, v = [x.strip() for x in tok.split("=", 1)]
+                if v.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+                    configured_ligs.append({"name": k, "file": v})
+                else:
+                    configured_ligs.append({"name": k, "smiles": v})
+            elif tok.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+                configured_ligs.append({"name": Path(tok).stem, "file": tok})
+            else:
+                configured_ligs.append({"name": tok, "smiles": tok})
+    config["ligands"] = discover_raw_ligands(root / "data" / "02_raw_ligands", configured_ligs)
 
     mechanism = load_mechanism_template(
         root,
@@ -243,8 +316,27 @@ def run(
 
     compatibility = []
     chemical_states = []
+    admet_rows = []
     for ligand in config["ligands"]:
-        if ligand.get("smiles"):
+        lig_file = ligand.get("file") or ligand.get("mol2")
+        mol2_block = ligand.get("mol2_block")
+        sdf_block = ligand.get("sdf_block")
+        if mol2_block or sdf_block or (lig_file and str(lig_file).lower().endswith((".mol2", ".sdf", ".mol", ".pdb"))):
+            resolved_f = resolve_path(root, str(lig_file)) if lig_file else None
+            if resolved_f is not None:
+                ligand["file"] = str(resolved_f)
+            assessment, chemical_state = assess_mol2_ligand(
+                ligand["name"],
+                file_path=resolved_f,
+                mol2_block=mol2_block,
+                sdf_block=sdf_block,
+                ph=experimental_ph,
+            )
+            compatibility.append(assessment)
+            chemical_states.append(chemical_state)
+            if assessment.get("admet"):
+                admet_rows.append(assessment["admet"])
+        elif ligand.get("smiles"):
             chemical_state = assess_ligand_chemical_state(
                 ligand["name"],
                 ligand["smiles"],
@@ -267,6 +359,10 @@ def run(
                 assessment["standard_vina_interpretation"] = False
             compatibility.append(assessment)
             chemical_states.append(chemical_state)
+            try:
+                admet_rows.append(compute_admet_druglikeness(ligand["name"], smiles=effective_smiles))
+            except Exception as exc:
+                LOGGER.debug("Skipped ADMET for %s: %s", ligand["name"], exc)
             if assessment["flags"]:
                 LOGGER.warning(
                     "%s requires review before biological interpretation: %s",
@@ -274,6 +370,7 @@ def run(
                     "; ".join(assessment["flags"]),
                 )
     write_ligand_compatibility_report(compatibility, root / "reports" / "ligand_compatibility.json")
+    write_admet_report(admet_rows, root / "reports" / "admet_druglikeness.csv")
     write_chemical_state_report(
         chemical_states,
         root / "reports" / "chemical_state.json",
@@ -418,9 +515,21 @@ def run(
 
     def _process_single_ligand(ligand: dict) -> None:
         ligand_assessment = next((row for row in compatibility if row["name"] == ligand["name"]), {})
-        pdbqt = prepare_ligand(ligand["name"], ligand.get("smiles"), root / "data" / "04_prepped_ligands")
+        lig_file_path = resolve_path(root, str(ligand.get("file") or ligand.get("mol2"))) if (ligand.get("file") or ligand.get("mol2")) else None
+        pdbqt = prepare_ligand(
+            ligand["name"],
+            ligand.get("smiles"),
+            root / "data" / "04_prepped_ligands",
+            file_path=lig_file_path,
+            mol2_block=ligand.get("mol2_block"),
+            sdf_block=ligand.get("sdf_block"),
+        )
         sugar_conformers = []
-        if ligand_assessment.get("sugar_like") and ligand.get("smiles"):
+        if (
+            ligand_assessment.get("sugar_like")
+            and ligand.get("smiles")
+            and advanced.get("polysaccharide", {}).get("enabled", False)
+        ):
             sugar_cfg = advanced.get("polysaccharide", {})
             sugar_conformers, manifest_path = prepare_polysaccharide_conformers(
                 ligand["name"],
@@ -587,6 +696,10 @@ def run(
             if summary_csv_path.is_file():
                 df_sum = pd.read_csv(summary_csv_path)
                 mask = df_sum["Ligand"].astype(str) == ligand["name"]
+                if "Receptor" not in df_sum.columns:
+                    df_sum.insert(0, "Receptor", receptor_input.stem)
+                else:
+                    df_sum.loc[mask, "Receptor"] = receptor_input.stem
                 df_sum.loc[mask, "Refinement_Delta_E_kcal"] = round(float(refinement_info.get("energy_improvement_kcal", 0.0)), 3)
                 df_sum.loc[mask, "Refinement_RMSD_A"] = round(float(refinement_info.get("refinement_rmsd_A", 0.0)), 4)
                 df_sum.to_csv(summary_csv_path, index=False)
@@ -676,14 +789,26 @@ def run(
                     None,
                     use_cache=use_cache,
                 )
+                ens_rep_dir = root / "reports" / "ensemble" / ens_stem
                 ens_sum = score_docking(
                     ens_dock_out,
                     ens_cleaned,
                     ligand["name"],
                     config,
-                    root / "reports" / "ensemble" / ens_stem,
+                    ens_rep_dir,
                 )
                 ens_sum["Receptor"] = ens_stem
+                ens_refined = ens_rep_dir / "active_poses" / f"{ligand['name']}_refined.pdb"
+                ens_ref_info = refine_active_pose_in_pocket(Path(ens_sum["active_pose"]), ens_refined, catalytic_resseq=cat_num)
+                if ens_ref_info.get("refined") and float(ens_ref_info.get("energy_improvement_kcal", 0.0)) > 0.0 and ens_refined.is_file():
+                    shutil.copyfile(ens_refined, Path(ens_sum["active_pose"]))
+                ens_inter = analyze_interactions(
+                    Path(ens_sum["active_pose"]),
+                    ens_rep_dir / "interactions" / f"{ligand['name']}_interactions.csv",
+                    cat_num,
+                    target_chain=config["receptor"]["chain_id"],
+                )
+                update_interaction_summary(ens_rep_dir / "docking_summary.csv", ligand["name"], ens_inter)
                 ensemble_rows.append(dict(ens_sum))
         if len(ensemble_rows) > len(config["ligands"]):
             aggregate_ensemble_results(ensemble_rows, root / "reports" / "ensemble_consensus.csv")
@@ -703,6 +828,13 @@ def run(
                     LOGGER.info("Co-crystal redocking control for %s: RMSD=%.3f A (%s)", ligand["name"], redock_res["symmetry_corrected_rmsd_A"], redock_res["status"])
                     break
 
+    if not skip_vina:
+        try:
+            html_report = generate_visual_html_report(root, catalytic_num=cat_num)
+            LOGGER.info("Generated standalone visual HTML report: %s", html_report)
+        except Exception as exc:
+            LOGGER.warning("Visual HTML report generation skipped: %s", exc)
+
     if not skip_vina and advanced.get("evaluation", {}).get("enabled"):
         exp_csv = resolve_path(root, advanced["evaluation"].get("experimental_csv", "data/experimental_activity.csv"))
         if exp_csv.is_file() and (root / "reports" / "docking_summary.csv").is_file():
@@ -715,14 +847,24 @@ def run(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Universal Mechanism-Guided AutoDock Vina Pipeline v6.0")
+    parser = argparse.ArgumentParser(description="Universal Mechanism-Guided AutoDock Vina Pipeline v4.0")
     parser.add_argument("--config", type=Path, default=Path("config/pipeline_config.yaml"))
     parser.add_argument("--skip-vina", action="store_true", help="Prepare ligands/receptor only")
     parser.add_argument("--preflight", action="store_true", help="Check inputs and external dependencies without running")
     parser.add_argument("--allow-specialized", action="store_true", help="Explicitly allow exploratory runs for specialized systems")
     parser.add_argument("--no-cache", action="store_true", help="Force re-execution of Vina even when checkpoint cache matches")
     parser.add_argument("--workers", type=int, default=None, help="Number of parallel worker threads for batch ligand screening")
+    parser.add_argument("--receptor", action="append", default=None, help="Receptor PDB path(s); repeat or separate with ';' for multiple receptors")
+    parser.add_argument("--ligand", action="append", default=None, help="Ligand entry (path/to/file.mol2, Name=path.mol2, or Name=SMILES); repeat for multiple")
     args = parser.parse_args()
     if args.preflight:
         raise SystemExit(preflight(args.config))
-    run(args.config, args.skip_vina, args.allow_specialized, use_cache=not args.no_cache, max_workers=args.workers)
+    run(
+        args.config,
+        args.skip_vina,
+        args.allow_specialized,
+        use_cache=not args.no_cache,
+        max_workers=args.workers,
+        cli_receptors=args.receptor,
+        cli_ligands=args.ligand,
+    )

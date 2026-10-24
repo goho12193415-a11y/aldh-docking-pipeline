@@ -58,13 +58,18 @@ def _parse_ligands(values: list[str] | None, raw_dir: Path | None = None) -> lis
         if not text:
             continue
         if "=" in text:
-            name, smiles = text.split("=", 1)
-            name, smiles = name.strip(), smiles.strip()
-            if not name or not smiles:
-                raise ValueError(f"Ligand must have both name and SMILES: {value}")
-            ligands.append({"name": name, "smiles": smiles})
+            name, rhs = text.split("=", 1)
+            name, rhs = name.strip(), rhs.strip()
+            if not name or not rhs:
+                raise ValueError(f"Ligand must have both name and value: {value}")
+            if rhs.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+                ligands.append({"name": name, "file": rhs})
+            else:
+                ligands.append({"name": name, "smiles": rhs})
+        elif text.lower().endswith((".mol2", ".sdf", ".mol", ".pdb", ".pdbqt")):
+            p = Path(text)
+            ligands.append({"name": p.stem, "file": str(p)})
         else:
-            # Allow passing just a compound name (e.g. Hexanal) and auto-resolve from PubChem
             name = text
             smiles = fetch_smiles(name)
             ligands.append({"name": name, "smiles": smiles})
@@ -75,16 +80,31 @@ def _parse_ligands(values: list[str] | None, raw_dir: Path | None = None) -> lis
     return ligands
 
 
-def create_quick_config(project_root: Path, receptor: Path, ligand_values: list[str], output: Path) -> Path:
+def create_quick_config(project_root: Path, receptor: Path | str, ligand_values: list[str], output: Path) -> Path:
     template_path = project_root / "config" / "pipeline_config.yaml"
     with template_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    receptor = receptor.resolve()
-    if not receptor.is_file():
+    raw_rec_parts = [p.strip() for p in str(receptor).split(";") if p.strip()]
+    resolved_receptors = []
+    for rp in raw_rec_parts:
+        cand = Path(rp)
+        if not cand.is_absolute():
+            cand = (project_root / cand).resolve()
+        else:
+            cand = cand.resolve()
+        if not cand.is_file():
+            raise FileNotFoundError(cand)
+        resolved_receptors.append(cand)
+    if not resolved_receptors:
         raise FileNotFoundError(receptor)
+    receptor = resolved_receptors[0]
     chain, selection = _pick_chain(receptor)
     config = copy.deepcopy(config)
     config["receptor"]["input_pdb"] = str(receptor)
+    config["receptor"]["input_pdbs"] = [str(r) for r in resolved_receptors]
+    if len(resolved_receptors) > 1:
+        config.setdefault("advanced", {}).setdefault("receptor_ensemble", {})["enabled"] = True
+        config["advanced"]["receptor_ensemble"]["inputs"] = [str(r) for r in resolved_receptors[1:]]
     config["receptor"]["chain_id"] = chain
     config["receptor"]["cofactor_chain"] = chain
     config["receptor"]["template_pdb"] = None

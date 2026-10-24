@@ -179,13 +179,23 @@ def _render_matplotlib_fallback(
 
         receptor, ligand = parse_complex(complex_pdb)
         dpi = 300
-        fig = plt.figure(figsize=(png_width / dpi, png_height / dpi), dpi=dpi)
-        ax = fig.add_subplot(111, projection="3d")
+        fig = plt.figure(figsize=(png_width / dpi, png_height / dpi), dpi=dpi, facecolor="#F6F1E4")
+        ax = fig.add_subplot(111, projection="3d", facecolor="#F6F1E4")
         if ligand:
             lx = [a["coord"][0] for a in ligand]
             ly = [a["coord"][1] for a in ligand]
             lz = [a["coord"][2] for a in ligand]
-            ax.scatter(lx, ly, lz, c="#00A8E8", s=80, label=f"Ligand ({prefix})")
+            # Draw fountain-pen covalent bonds for ligand
+            for i in range(len(ligand)):
+                for j in range(i + 1, len(ligand)):
+                    if distance(ligand[i]["coord"], ligand[j]["coord"]) <= 1.88:
+                        ax.plot(
+                            [ligand[i]["coord"][0], ligand[j]["coord"][0]],
+                            [ligand[i]["coord"][1], ligand[j]["coord"][1]],
+                            [ligand[i]["coord"][2], ligand[j]["coord"][2]],
+                            color="#2B2520", linewidth=2.0, alpha=0.9,
+                        )
+            ax.scatter(lx, ly, lz, c="#3B5A75", edgecolors="#2B2520", linewidths=1.2, s=95, label=f"Ligand Sketch ({prefix})")
         pocket = [
             a for a in receptor
             if any(distance(a["coord"], la["coord"]) <= 6.5 for la in ligand)
@@ -194,11 +204,11 @@ def _render_matplotlib_fallback(
             px = [a["coord"][0] for a in pocket]
             py = [a["coord"][1] for a in pocket]
             pz = [a["coord"][2] for a in pocket]
-            ax.scatter(px, py, pz, c="#94A3B8", s=25, alpha=0.6, label="Active Site Pocket (<6.5 A)")
-        ax.set_title(f"{prefix} Active-Site Pose & Interactions ({len(interactions)} contacts)")
-        ax.legend(loc="upper right")
+            ax.scatter(px, py, pz, c="#C9BFA8", edgecolors="#5C5346", linewidths=0.8, s=32, alpha=0.75, label="Pocket Frame (<6.5 A)")
+        ax.set_title(f"Plate I: {prefix} Active-Site Sketch ({len(interactions)} contacts)", color="#2B2520", fontfamily="serif")
+        ax.legend(loc="upper right", facecolor="#FBF8F1", edgecolor="#2B2520")
         fig.tight_layout()
-        fig.savefig(png_path, dpi=dpi)
+        fig.savefig(png_path, dpi=dpi, facecolor="#F6F1E4")
         plt.close(fig)
     except Exception as exc:
         LOGGER.debug("Matplotlib fallback figure generation skipped: %s", exc)
