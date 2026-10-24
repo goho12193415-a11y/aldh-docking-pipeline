@@ -157,8 +157,10 @@ def reconstruct_missing_sidechains(structure, chain_id: str) -> list[dict]:
         "CYS": ("SG", "S", 1.81),
         "SER": ("OG", "O", 1.42),
         "THR": ("OG1", "O", 1.43),
-        "ASN": ("ND2", "N", 1.48),
-        "ASP": ("OD1", "O", 1.48),
+        # These terminal atoms are bonded to CG, not CB; the CB->ND2/OD1
+        # through-space distance is ~2.45 A.
+        "ASN": ("ND2", "N", 2.45),
+        "ASP": ("OD1", "O", 2.45),
         "GLU": ("OE1", "O", 2.45),
         "GLN": ("NE2", "N", 2.45),
         "HIS": ("NE2", "N", 2.40),
@@ -510,11 +512,10 @@ def transplant_cofactor(
             f"Template C-alpha superposition RMSD ({rmsd:.2f} A) exceeds safe cofactor transplantation threshold ({max_rmsd_A:.2f} A)."
         )
 
+    # Only cofactors from the template chain that was actually superimposed may
+    # be transformed with that chain's rotation/translation.
     template_cofactors = [
-        residue
-        for template_model in template
-        for template_source_chain in template_model
-        for residue in template_source_chain
+        residue for residue in template_chain
         if residue.get_resname().strip() in cofactor_names
     ]
     protein_coords = np.array(
@@ -547,7 +548,9 @@ def transplant_cofactor(
                 cof_coords = np.array([a.get_coord() for a in copied], dtype=float)
                 min_dist = _min_interatomic_distance(cof_coords, protein_coords)
                 clash_count = _count_clashes(cof_coords, protein_coords, cutoff=2.0)
-        copied.id = (copied.id[0], copied.id[1], copied.id[2])
+        if copied.id in {residue.id for residue in target_chain}:
+            next_resseq = max((residue.id[1] for residue in target_chain if residue.id[0] != " "), default=9000) + 1
+            copied.id = (copied.id[0], next_resseq, " ")
         target_chain.add(copied)
         transplanted_records.append({
             "resname": copied.get_resname().strip(),

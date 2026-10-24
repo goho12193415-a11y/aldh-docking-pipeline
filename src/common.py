@@ -120,9 +120,32 @@ def require_executable(name_or_path: str) -> str:
     )
 
 
+_AUTODOCK_ELEMENT_MAP = {
+    "A": "C", "C": "C", "N": "N", "O": "O", "S": "S", "P": "P",
+    "H": "H", "HD": "H", "HS": "H", "NA": "N", "NS": "N",
+    "OA": "O", "OS": "O", "SA": "S", "CL": "CL", "BR": "BR",
+    "F": "F", "I": "I", "ZN": "ZN", "MG": "MG", "FE": "FE",
+    "MN": "MN", "CA": "CA", "CU": "CU", "NI": "NI", "CO": "CO",
+}
+
+
+def _normalize_element(raw: str) -> str:
+    token = (raw or "").strip().upper()
+    if token in _AUTODOCK_ELEMENT_MAP:
+        return _AUTODOCK_ELEMENT_MAP[token]
+    if len(token) == 2 and token.isalpha():
+        return token
+    return token[:1] or "C"
+
+
 def atom_dict(line: str) -> dict[str, Any]:
-    """Parse ATOM/HETATM line from either PDB or PDBQT (extracting real partial charge when present)."""
-    element = line[76:78].strip() if len(line) >= 78 else ""
+    """Parse an ATOM/HETATM line from PDB or PDBQT.
+
+    PDBQT stores an AutoDock atom type in columns 78-79 (1-based) together with a
+    partial charge in 67-76; PDB stores the element in columns 77-78.  A non-blank
+    numeric charge field is used to distinguish the two layouts so that aromatic
+    carbon type ``A`` is not mistaken for a chemical element.
+    """
     charge: float | None = None
     if len(line) >= 76:
         q_field = line[66:76].strip()
@@ -132,9 +155,11 @@ def atom_dict(line: str) -> dict[str, Any]:
             except ValueError:
                 charge = None
     raw_name = line[12:16].strip()
-    inferred_el = element or (raw_name[:1] if raw_name else "C")
-    if inferred_el.upper() in {"OA", "NA", "SA", "HD"}:
-        inferred_el = {"OA": "O", "NA": "N", "SA": "S", "HD": "H"}[inferred_el.upper()]
+    if charge is not None and len(line) >= 79:
+        raw_type = line[77:79].strip() or (line[76:78].strip() if len(line) >= 78 else "")
+    else:
+        raw_type = line[76:78].strip() if len(line) >= 78 else ""
+    element = _normalize_element(raw_type or (raw_name[:1] if raw_name else "C"))
     return {
         "record": line[0:6].strip(),
         "serial": int(line[6:11].strip()),
@@ -147,7 +172,9 @@ def atom_dict(line: str) -> dict[str, Any]:
             dtype=float,
         ),
         "charge": charge,
-        "element": inferred_el,
+        "element": element,
+        "type": raw_type.upper(),
+        "aromatic": raw_type.upper() == "A",
         "line": line.rstrip("\n"),
     }
 

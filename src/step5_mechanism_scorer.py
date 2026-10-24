@@ -367,7 +367,15 @@ def _locate_nucleophile(receptor_atoms: list[dict], config: dict) -> dict:
     return nuc
 
 
-def score_docking(output_pdbqt: Path, receptor_pdb: Path, ligand_name: str, config: dict, reports_dir: Path) -> dict:
+def score_docking(
+    output_pdbqt: Path,
+    receptor_pdb: Path,
+    ligand_name: str,
+    config: dict,
+    reports_dir: Path,
+    run_id: str | None = None,
+    seed: int | None = None,
+) -> dict:
     parsed_pairs = parse_models_and_flex(output_pdbqt)
     scores = parse_vina_scores(output_pdbqt)
     receptor_atoms = read_receptor_atoms(receptor_pdb)
@@ -444,18 +452,17 @@ def score_docking(output_pdbqt: Path, receptor_pdb: Path, ligand_name: str, conf
     d_nuc_max = float(thresholds.get("d_nuc_max", default_max))
     d_hyd_max = float(thresholds.get("d_hyd_max", 4.5))
     d_oxy_max = float(thresholds.get("d_oxy_max", 5.0))
-    adaptive_cofactor = bool(thresholds.get("adaptive_cofactor_hydride_max", True))
 
     d_sg_c4n = round(distance(cys["coord"], nad["coord"]), 3) if nad is not None else None
     if nad is None:
         cofactor_conformation = "apo_or_no_nad"
-        effective_d_hyd_max = d_hyd_max
-    elif d_sg_c4n is not None and d_sg_c4n > 5.2 and adaptive_cofactor:
+    elif d_sg_c4n is not None and d_sg_c4n > 5.2:
         cofactor_conformation = "contracted_hydrolysis_out"
-        effective_d_hyd_max = round(max(d_hyd_max, d_sg_c4n + 1.2), 3)
     else:
         cofactor_conformation = "productive_hydride_in"
-        effective_d_hyd_max = d_hyd_max
+    # The hydride-transfer criterion is never relaxed: a pose with the cofactor
+    # out of its productive conformation is reported as such, not as competent.
+    effective_d_hyd_max = d_hyd_max
 
     rows = []
     for mode_index, (model, flex_model) in enumerate(parsed_pairs, start=1):
@@ -484,19 +491,21 @@ def score_docking(output_pdbqt: Path, receptor_pdb: Path, ligand_name: str, conf
         physchem_score = physchem["PhysChem_Score_kcal_mol"]
 
         nuc_ok = d_nuc_min <= d_nuc_val <= d_nuc_max
+        hyd_ok: bool | str
         if family == "aldh":
             if nad is None:
-                hyd_ok = True
-            elif cofactor_conformation == "contracted_hydrolysis_out":
-                oxy_dists = [v for v in (d_oxy_asn_val, d_oxy_cysn_val) if v != ""]
-                oxy_ok = (min(oxy_dists) <= d_oxy_max) if oxy_dists else True
-                hyd_ok = (float(d_hyd_val) <= effective_d_hyd_max) and (oxy_ok or float(d_hyd_val) <= float(d_sg_c4n))
+                hyd_ok = "not_assessable_no_cofactor"
+                # Without a retained cofactor only the nucleophilic step can be
+                # assessed; hydride transfer is explicitly reported as unassessed.
+                competent_flag = bool(nuc_ok)
             else:
-                hyd_ok = float(d_hyd_val) <= d_hyd_max
-            competent_flag = bool(nuc_ok and hyd_ok)
+                hyd_ok = bool(float(d_hyd_val) <= d_hyd_max)
+                competent_flag = bool(nuc_ok and hyd_ok)
         elif family == "general_binding":
+            hyd_ok = ""
             competent_flag = bool(physchem_score <= -1.0 or nuc_ok)
         else:
+            hyd_ok = ""
             competent_flag = bool(nuc_ok)
 
         affinity_val = scores[mode_index - 1] if mode_index <= len(scores) and scores[mode_index - 1] is not None else ""
@@ -508,6 +517,8 @@ def score_docking(output_pdbqt: Path, receptor_pdb: Path, ligand_name: str, conf
 
         row = {
             "Ligand": ligand_name,
+            "Run_ID": run_id or "",
+            "Seed": seed if seed is not None else "",
             "Mode": mode_index,
             "Binding_Affinity_kcal_mol": affinity_val,
             "PhysChem_Score_kcal_mol": physchem_score,
@@ -517,7 +528,10 @@ def score_docking(output_pdbqt: Path, receptor_pdb: Path, ligand_name: str, conf
             "d_oxy_cysN_A": d_oxy_cysn_val,
             "Burgi_Dunitz_Angle_deg": bd_angle,
             "Cofactor_Conformation": cofactor_conformation,
+            "d_sg_c4n_A": d_sg_c4n if d_sg_c4n is not None else "",
             "Effective_d_hyd_Max_A": effective_d_hyd_max if nad else "",
+            "Nucleophile_Competent": bool(nuc_ok),
+            "Hydride_Transfer_Competent": hyd_ok,
             "Catalytic_Geometry_Score": geom_score,
             "Catalytically_Competent": competent_flag,
         }

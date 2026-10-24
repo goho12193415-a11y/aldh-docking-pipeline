@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .common import atom_dict, distance, require_executable
@@ -34,14 +37,120 @@ CHARGED_REC_ATOMS = {
 METAL_RES = {"ZN", "MG", "FE", "MN", "CA", "CU", "NI", "CO"}
 COFACTOR_RES = {"NAD", "NAP", "NDP", "FAD", "FMN", "HEM", "HEC", "HEA"}
 
+# Atom names that define the aromatic ring of each residue (PDB naming).
+RECEPTOR_RING_ATOMS = {
+    "PHE": [["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]],
+    "TYR": [["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]],
+    "TRP": [
+        ["CG", "CD1", "NE1", "CE2", "CD2"],
+        ["CD2", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+    ],
+    "HIS": [["CG", "ND1", "CD2", "CE1", "NE2"]],
+}
+
+
+def _plane_geometry(points: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return ring centroid, unit normal and maximum out-of-plane deviation."""
+    coords = np.asarray(points, dtype=float)
+    center = coords.mean(axis=0)
+    centered = coords - center
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = vh[-1]
+    deviation = float(np.max(np.abs(centered @ normal)))
+    return center, normal, deviation
+
+
+def _ligand_aromatic_rings(ligand: list[dict]) -> list[dict]:
+    """Infer planar 5/6-membered ligand rings from a distance-based bond graph."""
+    heavy = [atom for atom in ligand if atom["element"].upper() != "H"]
+    adjacency = {index: set() for index in range(len(heavy))}
+    for i in range(len(heavy)):
+        for j in range(i + 1, len(heavy)):
+            bond = distance(heavy[i]["coord"], heavy[j]["coord"])
+            if 1.10 <= bond <= 1.90:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+    cycles: set[tuple[int, ...]] = set()
+
+    def _walk(start: int, current: int, path: list[int], visited: set[int]) -> None:
+        for neighbour in adjacency[current]:
+            if neighbour == start and len(path) >= 5:
+                cycles.add(tuple(sorted(path)))
+            elif neighbour > start and neighbour not in visited and len(path) < 6:
+                _walk(start, neighbour, path + [neighbour], visited | {neighbour})
+
+    for start in range(len(heavy)):
+        _walk(start, start, [start], {start})
+
+    rings: list[dict] = []
+    for cycle in sorted(cycles, key=len):
+        if not 5 <= len(cycle) <= 6:
+            continue
+        center, normal, deviation = _plane_geometry([heavy[index]["coord"] for index in cycle])
+        if deviation <= 0.20:  # planar rings only; chair cyclohexane is excluded
+            rings.append({
+                "atoms": [heavy[index] for index in cycle],
+                "center": center,
+                "normal": normal,
+            })
+    return rings
+
+
+def _receptor_aromatic_rings(receptor: list[dict], target_chain: str | None) -> list[dict]:
+    by_residue: dict[tuple[str, str, int], dict[str, dict]] = {}
+    for atom in receptor:
+        if target_chain and atom["chain"] != target_chain:
+            continue
+        by_residue.setdefault((atom["chain"], atom["resname"], atom["resseq"]), {})[atom["name"]] = atom
+
+    rings: list[dict] = []
+    for (_, resname, resseq), atoms in by_residue.items():
+        for names in RECEPTOR_RING_ATOMS.get(resname, []):
+            if not all(name in atoms for name in names):
+                continue
+            center, normal, deviation = _plane_geometry([atoms[name]["coord"] for name in names])
+            if deviation <= 0.25:
+                rings.append({
+                    "label": f"{resname}{resseq}",
+                    "atoms": [atoms[name] for name in names],
+                    "center": center,
+                    "normal": normal,
+                })
+    return rings
+
+
+def _pi_stack_geometry(ligand_ring: dict, receptor_ring: dict) -> tuple[float, str] | None:
+    """Apply centroid distance, interplanar angle and lateral-offset criteria."""
+    vector = ligand_ring["center"] - receptor_ring["center"]
+    centroid_distance = float(np.linalg.norm(vector))
+    if centroid_distance > 5.5:
+        return None
+    cosine = abs(float(np.dot(ligand_ring["normal"], receptor_ring["normal"])))
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+    if angle <= 30.0:
+        lateral = float(np.linalg.norm(vector - np.dot(vector, receptor_ring["normal"]) * receptor_ring["normal"]))
+        if 3.3 <= centroid_distance <= 4.5 and lateral <= 2.2:
+            return centroid_distance, "parallel"
+    elif angle >= 60.0 and 3.5 <= centroid_distance <= 5.5:
+        return centroid_distance, "t_shaped"
+    return None
+
 
 def analyze_interactions(
     complex_pdb: Path,
     output_csv: Path,
     cys_res_num: int,
     target_chain: str | None = None,
+    max_catalytic_attack_A: float = 4.5,
+    max_hydride_transfer_A: float = 5.0,
 ) -> pd.DataFrame:
-    """Comprehensive 3D protein-ligand interaction profiler across all ligand polar, charged, aromatic, halogen, and aliphatic atoms."""
+    """Profile protein-ligand interactions with explicit geometric cutoffs.
+
+    Only contacts inside the configured distance windows are reported; catalytic
+    and hydride-transfer rows are not emitted for poses that are merely in the
+    same protein-ligand complex.
+    """
     receptor, ligand = parse_complex(complex_pdb)
     if not ligand:
         output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -50,12 +159,20 @@ def analyze_interactions(
         return empty
 
     lig_heavy = [a for a in ligand if a["element"].upper() != "H" and a["name"] != "HD"] or ligand
-    lig_polar = [a for a in lig_heavy if a["element"].upper() in {"O", "N", "S"} or a["name"] in {"OA", "NA", "SA"}]
-    lig_c = [a for a in lig_heavy if a["element"].upper() == "C" or a["name"] == "A"]
+    lig_polar = [a for a in lig_heavy if a["element"].upper() in {"O", "N", "S"}]
+    lig_c = [a for a in lig_heavy if a["element"].upper() == "C"]
     lig_halogens = [a for a in lig_heavy if a["element"].upper() in {"F", "CL", "BR", "I"}]
 
-    if lig_polar and lig_c:
-        # Pick the carbon bonded to a polar atom (e.g., carbonyl/warhead carbon)
+    # Prefer a genuine C=O / C=N / C=S bond over an arbitrary C-O single bond.
+    reactive_pairs = [
+        (carbon, polar, distance(carbon["coord"], polar["coord"]))
+        for carbon in lig_c
+        for polar in lig_polar
+        if 1.15 <= distance(carbon["coord"], polar["coord"]) <= 1.34
+    ]
+    if reactive_pairs:
+        carbonyl_c = min(reactive_pairs, key=lambda item: item[2])[0]
+    elif lig_polar and lig_c:
         pairs = [(c, p, distance(c["coord"], p["coord"])) for c in lig_c for p in lig_polar]
         carbonyl_c = min(pairs, key=lambda item: item[2])[0]
     elif lig_c:
@@ -63,7 +180,13 @@ def analyze_interactions(
     else:
         carbonyl_c = lig_heavy[0]
 
-    aliphatic = ([a for a in lig_c if a["serial"] != carbonyl_c["serial"]] if lig_polar else lig_c) or (lig_c if lig_c else lig_heavy)
+    aliphatic = (
+        [a for a in lig_c if a["serial"] != carbonyl_c["serial"]]
+        if lig_polar
+        else lig_c
+    ) or lig_c or lig_heavy
+    ligand_rings = _ligand_aromatic_rings(ligand)
+    receptor_rings = _receptor_aromatic_rings(receptor, target_chain)
     rows: list[dict] = []
     seen_contacts: set[tuple[str, str, str, str]] = set()
 
@@ -85,13 +208,17 @@ def analyze_interactions(
         r_res_label = f"{atom['resname']}{atom['resseq']}"
         r_el = atom["element"].upper()
 
-        # 1. Catalytic attack (CYS, SER, THR, LYS, ASP, GLU, HIS)
+        # 1. Catalytic attack: only within the configured nucleophile window.
         if atom["resseq"] == cys_res_num and atom["name"] in {"SG", "OG", "OG1", "NZ", "OD1", "OE1", "NE2"}:
-            _add_row("Catalytic_Attack", carbonyl_c["name"], r_res_label, atom["name"], distance(carbonyl_c["coord"], atom["coord"]))
+            attack_distance = distance(carbonyl_c["coord"], atom["coord"])
+            if attack_distance <= float(max_catalytic_attack_A):
+                _add_row("Catalytic_Attack", carbonyl_c["name"], r_res_label, atom["name"], attack_distance)
 
-        # 2. Hydride transfer / cofactor reactive contact (NAD C4N, FAD N5, HEM FE)
+        # 2. Hydride transfer / cofactor reactive contact: only within the window.
         if atom["resname"] in COFACTOR_RES and atom["name"] in {"C4N", "C4", "N5", "C4X", "FE"}:
-            _add_row("Hydride_Transfer", carbonyl_c["name"], r_res_label, atom["name"], distance(carbonyl_c["coord"], atom["coord"]))
+            hydride_distance = distance(carbonyl_c["coord"], atom["coord"])
+            if hydride_distance <= float(max_hydride_transfer_A):
+                _add_row("Hydride_Transfer", carbonyl_c["name"], r_res_label, atom["name"], hydride_distance)
 
         # 3. Metal coordination across all ligand polar atoms
         if atom["resname"] in METAL_RES or (atom["resname"] in {"HEM", "HEC"} and atom["name"] == "FE"):
@@ -100,18 +227,18 @@ def analyze_interactions(
                 if 1.65 <= d_m <= 3.20:
                     _add_row("Metal_Coordination", lp["name"], r_res_label, atom["name"], d_m)
 
-        # 4. Hydrogen bonds across ALL ligand polar atoms (O, N, S)
+        # 4. Hydrogen bonds across all ligand polar atoms (distance-based screen)
         if r_el in {"N", "O", "S"}:
             for lp in lig_polar:
                 d_hb = distance(lp["coord"], atom["coord"])
                 if 2.20 <= d_hb <= 3.50:
                     _add_row("Hydrogen_Bond", lp["name"], r_res_label, atom["name"], d_hb)
 
-        # 5. Salt bridges between polar/charged ligand groups and charged receptor sidechains
+        # 5. Salt bridges between ligand polar atoms and charged receptor sidechains
         if (atom["resname"], atom["name"]) in CHARGED_REC_ATOMS:
             for lp in lig_polar:
                 d_sb = distance(lp["coord"], atom["coord"])
-                if 2.40 <= d_sb <= 4.00 and (abs(float(lp.get("charge") or 0.0)) >= 0.25 or lp["element"].upper() in {"O", "N"}):
+                if 2.40 <= d_sb <= 4.00:
                     _add_row("Salt_Bridge", lp["name"], r_res_label, atom["name"], d_sb)
 
         # 6. Halogen bonds (C-X ... O/N/S)
@@ -121,25 +248,31 @@ def analyze_interactions(
                 if 2.70 <= d_xb <= 3.80:
                     _add_row("Halogen_Bond", lx["name"], r_res_label, atom["name"], d_xb)
 
-    # 7. Pi-Stacking and Hydrophobic contacts (per-residue shortest distance)
+    # 7. Pi-stacking between ligand rings and receptor aromatic rings (centroid based)
+    pi_hits: dict[str, dict] = {}
+    for receptor_ring in receptor_rings:
+        for ligand_ring in ligand_rings:
+            geometry = _pi_stack_geometry(ligand_ring, receptor_ring)
+            if geometry is None:
+                continue
+            centroid_distance, _ = geometry
+            label = receptor_ring["label"]
+            if label not in pi_hits or centroid_distance < pi_hits[label]["Distance_A"]:
+                pi_hits[label] = {
+                    "Type": "Pi_Stacking",
+                    "Ligand_Atom": ligand_ring["atoms"][0]["name"],
+                    "Receptor_Res": label,
+                    "Receptor_Atom": receptor_ring["atoms"][0]["name"],
+                    "Distance_A": round(centroid_distance, 3),
+                }
+
+    # 8. Hydrophobic contacts: shortest carbon-carbon contact per residue
     hydro_hits: dict[tuple[str, str, int], dict] = {}
-    pi_hits: dict[tuple[str, str, int], dict] = {}
     for atom in receptor:
         if target_chain and atom["chain"] != target_chain:
             continue
         rname = atom["resname"]
         key = (atom["chain"], rname, atom["resseq"])
-        if rname in AROMATIC_RES and atom["name"] in {"CG", "CD1", "CD2", "CE1", "CE2", "CZ", "CE3", "CZ2", "CZ3"}:
-            for lc in lig_c:
-                d_pi = distance(lc["coord"], atom["coord"])
-                if 3.35 <= d_pi <= 4.30 and (key not in pi_hits or d_pi < pi_hits[key]["Distance_A"]):
-                    pi_hits[key] = {
-                        "Type": "Pi_Stacking",
-                        "Ligand_Atom": lc["name"],
-                        "Receptor_Res": f"{rname}{atom['resseq']}",
-                        "Receptor_Atom": atom["name"],
-                        "Distance_A": round(d_pi, 3),
-                    }
         if rname in HYDROPHOBIC_RES and atom["element"].upper() == "C" and atom["name"] not in {"C", "CA"}:
             for lc in aliphatic:
                 d = distance(lc["coord"], atom["coord"])
@@ -168,10 +301,12 @@ def _render_matplotlib_fallback(
     png_width: int = 2400,
     png_height: int = 1800,
 ) -> None:
-    if not pse_path.is_file():
-        pse_path.write_bytes(b"PYMOL_FALLBACK_SESSION_PLACEHOLDER\n")
-    if png_path.is_file() and png_path.stat().st_size > 0:
-        return
+    status_path = pse_path.with_name(f"{prefix}_render_status.json")
+    # PyMOL is unavailable in this branch: remove figures left by an earlier run
+    # so a stale session/PNG cannot be mistaken for the current docking result.
+    for stale in (pse_path, png_path):
+        if stale.is_file():
+            stale.unlink()
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -210,7 +345,19 @@ def _render_matplotlib_fallback(
         fig.tight_layout()
         fig.savefig(png_path, dpi=dpi, facecolor="#F6F1E4")
         plt.close(fig)
+        status_path.write_text(json.dumps({
+            "pymol_available": False,
+            "fallback_rendered": True,
+            "png_present": True,
+            "note": "PyMOL was unavailable; a schematic matplotlib figure was generated instead.",
+        }, indent=2), encoding="utf-8")
     except Exception as exc:
+        status_path.write_text(json.dumps({
+            "pymol_available": False,
+            "fallback_rendered": False,
+            "png_present": png_path.is_file() and png_path.stat().st_size > 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }, indent=2), encoding="utf-8")
         LOGGER.debug("Matplotlib fallback figure generation skipped: %s", exc)
 
 

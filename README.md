@@ -87,7 +87,7 @@ python main.py --config config/pipeline_config.yaml
 python scripts/validate_outputs.py
 ```
 
-`Catalytically_Competent=True` 要求亲核进攻距离合格，并且在受体保留 NAD/NADP 时同时满足羰基碳到 `C4N/C4` 的氢负离子转移距离阈值。如果没有任何 mode 同时满足，管道会明确写入 `Selection_Status=Affinity_Fallback_No_Catalytic_Pose`；此时导出的结构只能作为最低结合能参考构象，不能称为催化活性构象。
+`Catalytically_Competent=True` 要求亲核进攻距离合格，并且在受体保留 NAD/NADP 时同时满足羰基碳到 `C4N/C4` 的氢负离子转移距离阈值。氢负转移阈值是固定值，不会因为辅因子处于 “out” 构象而自动放宽；`Cofactor_Conformation=contracted_hydrolysis_out` 只作为诊断记录，这类构象不会被标成高置信度催化构象。结果表同时给出 `Nucleophile_Competent`、`Hydride_Transfer_Competent` 和 `d_sg_c4n_A`，便于逐项核对。如果没有任何 mode 同时满足，管道会写入 `Selection_Status=Affinity_Fallback_No_Catalytic_Pose`；此时导出的结构只能作为最低结合能参考构象，不能称为催化活性构象。
 
 输出位于 `reports/`：
 
@@ -153,7 +153,11 @@ python scripts/validate_outputs.py
 - `reports/capability_gate.json`：是否阻止了专用体系的标准解释；
 - `reports/run_manifest.json`：配置 SHA-256、机制模板、闸门状态和运行模式。
 
-机制模板位于 `config/mechanisms/`。目前 ALDH 模板是已实现评分的安全路径；丝氨酸水解酶、半胱氨酸蛋白酶和金属酶模板目前只提供准备/审计接口，默认不会被当作 ALDH 规则运行。严格闸门会阻止这些模板进入标准 docking；只有显式 `--allow-specialized` 才能进行探索性运行。
+机制模板位于 `config/mechanisms/`，共 9 个家族（ALDH、丝氨酸水解酶、半胱氨酸蛋白酶、金属酶、P450、激酶、糖苷酶、黄素酶、通用结合）。它们共享统一的准备、口袋定位、几何判据和审计流程；ALDH 的评分路径包含亲核进攻 + 氢负转移 + 氧阴离子穴，其余家族使用各自的几何判据（如金属配位、血红素铁距离、铰链区极性锚定），但都不等价于 QM/MM 反应能垒。严格闸门仍会阻止未实现或不支持的体系进入标准 docking；只有显式 `--allow-specialized` 才能进行探索性运行。
+
+`advanced.pose_refinement` 控制口袋内 L-BFGS-B 启发式精修。该分数是无量纲的经验评分，不是 kcal/mol 结合自由能；默认只生成 `*_refined.pdb` 作为诊断，不覆盖 Vina 构象。若设置 `propagate_to_downstream: true`，精修构象才会用于后续相互作用图、PyMOL 和 MD/QM 准备，并在 `docking_summary.csv` 的 `Refinement_Delta_Score` 中记录评分变化。
+
+每次完整 docking 运行会生成新的 `run_id`，写入 `run_manifest.json` 和汇总表的 `Run_ID`/`Seed` 列。运行开始前，旧的 `docking_summary.csv`、`consensus_summary.csv`、`multi_box_results.csv` 和 `ensemble_consensus.csv` 会移动到 `reports/archive/`，避免不同受体/口袋的结果被静默合并。
 
 快速实验会比较每条蛋白链的辅因子、催化 Cys 和蛋白规模，并用确定性规则选择目标链；候选证据会写入 `config/quick_config.yaml` 的 `project.auto_selection`。
 

@@ -1,9 +1,16 @@
-# ALDH_Docking_Pipeline Universal Technical Dossier (`v6.0`)
+# ALDH_Docking_Pipeline Universal Technical Dossier (`v8.5`)
 
-## 1. Executive Summary (`v6.0` Complete End-to-End Scientific & Engineering Closure)
-`ALDH_Docking_Pipeline` (`v6.0`) is a self-contained, zero-human-intervention, universal molecular docking, mechanism-aware rescoring, and post-docking refinement platform. Across `v4.0`, `v5.0`, and `v6.0`, all **16 deep algorithmic, physical, and workflow bottlenecks** have been resolved and verified by **47 automated unit tests**:
+## 1. Executive Summary (`v8.5` Sketchbook Release)
+`ALDH_Docking_Pipeline` (`v8.5`) is a self-contained, zero-human-intervention, universal molecular docking, mechanism-aware rescoring, and post-docking refinement platform. Across `v4.0`–`v8.5`, the algorithmic, physical and workflow bottlenecks are verified by **63 automated unit tests**:
 
-### `v6.0` New Capabilities (Closing All Post-Processing, QM/MM, PDBQT Tree & Benchmarking Disconnects)
+### `v8.5` New Capabilities (Sketchbook Release)
+1. **3D ligand formats**: native MOL2/SDF/MOL/PDB/PDBQT input with automatic desalting and fragment extraction (`src/step1_ligand_prep.py`).
+2. **Multi-receptor discovery**: `discover_raw_receptors()` expands CLI/config/`data/01_raw_receptors/*.pdb`, runs an ensemble, and records each receptor in the execution plan (`main.py`).
+3. **ADMET profiling**: Lipinski/Veber/QED descriptors written to `reports/admet_druglikeness.csv` (`src/common.py`).
+4. **HTML visual folio**: a standalone sketchbook-style report with an embedded 3D pose canvas (`src/system_upgrade.py`).
+5. **Scientific audit hardening**: fixed hydride-transfer cutoff (no cofactor-out auto-promotion), PDBQT atom-type parsing (`A`→aromatic C), distance-gated interaction rows, centroid/planarity π-stacking, per-run `run_id` archival, distinct replicate seeds, and explicit heuristic-refinement semantics.
+
+### `v6.0` Capabilities Retained (Closing All Post-Processing, QM/MM, PDBQT Tree & Benchmarking Disconnects)
 1. **Spanning-Tree Torsional `ROOT` + Nested `BRANCH/ENDBRANCH` Ligand PDBQT Compiler (`src/common.py`, `src/step1_ligand_prep.py`)**:
    - Replaced the rigid `TORSDOF 0` fallback in `write_fallback_pdbqt()` with a graph cycle/bridge analyzer that identifies all acyclic rotatable single bonds, partitions the molecule into rigid fragments, selects the optimal `ROOT`, and recursively emits nested `BRANCH u v ... ENDBRANCH u v` blocks with exact `TORSDOF N` counts.
 
@@ -16,7 +23,7 @@
    - Automatically validates total electron count vs. spin multiplicity parity (`spin_parity_validated: True`) for ORCA B3LYP-D3BJ/def2-SVP calculations.
 
 4. **End-to-End Downstream Propagation of L-BFGS-B Refined Poses & Automatic Ring Ensemble Routing (`main.py`)**:
-   - When in-pocket L-BFGS-B rigid+torsion refinement (`refine_active_pose_in_pocket`) lowers pocket energy, the refined coordinates automatically update `active_pose` before downstream interaction profiling, PyMOL rendering, PLIP, MD setup, QM/MM extraction, and covalent adduct building, while recording `Refinement_Delta_E_kcal` and `Refinement_RMSD_A` in `docking_summary.csv`.
+   - In-pocket L-BFGS-B rigid+torsion refinement (`refine_active_pose_in_pocket`) produces a diagnostic `*_refined.pdb` and records `Refinement_Delta_Score` (arbitrary units, **not** kcal/mol) and `Refinement_RMSD_A` in `docking_summary.csv`. The refined coordinates replace the docked pose for downstream interaction profiling, figures, and MD/QM preparation only when `advanced.pose_refinement.propagate_to_downstream: true`.
    - Automatically routes flexible-ring ligands through `prepare_ring_conformer_ensemble()` and `run_vina_ensemble()` when `ring_ensemble` is enabled.
 
 5. **Multi-Scorer Experimental Benchmarking, $\Delta G_{\text{exp}}$ RMSE/MAE & Early Enrichment `BEDROC` ($\alpha=20$) (`src/step10_evaluation.py`)**:
@@ -34,6 +41,6 @@
 - Hungarian algorithm (`scipy.optimize.linear_sum_assignment`) symmetry-corrected 3D RMSD and `--workers` multi-threaded execution.
 
 ## 2. Verification & Validation Summary
-- **Unit Test Suite**: `python3 -m unittest discover -s tests -v` — **47 / 47 tests pass**.
+- **Unit Test Suite**: `python3 -m unittest discover -s tests -v` — **63 / 63 tests pass**.
 - **Pipeline End-to-End Execution**: `python3 main.py --config config/pipeline_config.yaml --workers 2` — completes all stages and writes SQLite run history, CSV summaries, and PyMOL visualization scripts.
 - **Artifact Integrity Check**: `python3 scripts/validate_outputs.py` — passes with zero missing outputs.

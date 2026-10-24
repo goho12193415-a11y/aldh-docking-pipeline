@@ -647,7 +647,9 @@ def audit_docking_box(pdb_path: Path, box: dict, config: dict, output_json: Path
         }
         if not contained:
             flags.append(f"{label}_outside_docking_box")
-    if "catalytic_cys_sg" not in points:
+    family = str(config.get("enzyme", {}).get("mechanism_family", "")).lower()
+    catalytic_expected = bool(catalytic) and family not in {"general_binding", ""}
+    if catalytic_expected and "catalytic_cys_sg" not in points:
         flags.append("catalytic_cys_sg_not_found_for_box_audit")
     if receptor.get("keep_cofactors") and "cofactor_key" not in points:
         flags.append("configured_cofactor_key_atom_not_found_for_box_audit")
@@ -958,6 +960,28 @@ def evaluate_redocking_control(
     if output_json is not None:
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def resolve_replicate_seeds(count: int, seeds: list[int] | None) -> list[int | None]:
+    """Return exactly ``count`` distinct Vina seeds, extending deterministically if needed."""
+    requested = max(1, int(count))
+    configured = [int(seed) for seed in (seeds or [])]
+    if requested == 1:
+        return [configured[0] if configured else None]
+    if len(configured) >= requested:
+        result: list[int | None] = list(configured[:requested])
+    else:
+        result = list(configured)
+        base = configured[0] if configured else 101
+        offset = 1
+        while len(result) < requested:
+            candidate = base + 7919 * offset
+            offset += 1
+            if candidate not in result:
+                result.append(candidate)
+    if len(set(result)) != requested:
+        raise ValueError(f"Replicate seeds must be distinct; got {result}")
     return result
 
 

@@ -61,7 +61,8 @@ thresholds:
   d_nuc_max: 4.5
   d_hyd_max: 4.5
   d_oxy_max: 5.0
-  adaptive_cofactor_hydride_max: true
+  # The hydride-transfer cutoff is fixed; cofactor-out poses are reported as such
+  # and are never auto-promoted to "catalytically competent".
   hydrogen_bond_max: 3.5
   hydrophobic_min: 3.3
   hydrophobic_max: 4.0
@@ -91,6 +92,11 @@ advanced:
   receptor_ensemble:
     enabled: false
     inputs: []
+  pose_refinement:
+    enabled: true
+    # Heuristic in-pocket refinement is diagnostic by default; opt in to replace
+    # the docked pose used by interaction figures and downstream preparation.
+    propagate_to_downstream: false
   replicates:
     count: 1
     seeds: [101, 202, 303]

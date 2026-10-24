@@ -198,9 +198,11 @@ def refine_active_pose_in_pocket(
         "refined": True,
         "refined_pdb": str(output_pdb),
         "optimized_torsion_count": n_torsions,
-        "initial_pocket_energy_kcal": round(e_init, 3),
-        "refined_pocket_energy_kcal": round(e_final, 3),
-        "energy_improvement_kcal": round(e_init - e_final, 3),
+        # This is a heuristic in-pocket score in arbitrary units, not a physical
+        # kcal/mol energy; it must not be reported as a binding free energy.
+        "initial_pocket_score": round(e_init, 3),
+        "refined_pocket_score": round(e_final, 3),
+        "score_improvement": round(e_init - e_final, 3),
         "refinement_rmsd_A": round(rmsd, 4),
     }
 

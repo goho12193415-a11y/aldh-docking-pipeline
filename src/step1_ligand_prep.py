@@ -398,6 +398,10 @@ def prepare_polysaccharide_conformers(
                 "stereochemistry_preserved": True,
             })
     else:
+        LOGGER.warning(
+            "RDKit/Meeko unavailable for %s; falling back to a topological 3D builder. "
+            "Ring closure and stereochemistry are NOT guaranteed in this mode.", name,
+        )
         parsed = parse_smiles_tokens(smiles)
         if parsed["unassigned_chiral"]:
             raise ValueError(f"{name} has unassigned stereocenters at atom indices {parsed['unassigned_chiral']}")
@@ -414,7 +418,8 @@ def prepare_polysaccharide_conformers(
                 "conformer_id": ordinal - 1,
                 "sdf": str(sdf_path),
                 "pdbqt": str(pdbqt_path),
-                "stereochemistry_preserved": True,
+                "stereochemistry_preserved": False,
+                "geometry_method": "topological_bfs_fallback",
             })
 
     manifest_path = output_dir / f"{name}__sugar_conformers.json"
@@ -489,6 +494,10 @@ def prepare_ring_conformer_ensemble(
                 "pdbqt": str(pdbqt_path),
             })
     else:
+        LOGGER.warning(
+            "RDKit/Meeko unavailable for %s; ring conformers use the topological fallback "
+            "and may be non-physical.", name,
+        )
         parsed = parse_smiles_tokens(clean_smiles)
         for ordinal in range(1, max(1, int(num_conformers)) + 1):
             conf_name = f"{name}__ringconf{ordinal:03d}"
@@ -503,6 +512,8 @@ def prepare_ring_conformer_ensemble(
                 "conformer_id": ordinal - 1,
                 "sdf": str(sdf_path),
                 "pdbqt": str(pdbqt_path),
+                "stereochemistry_preserved": False,
+                "geometry_method": "topological_bfs_fallback",
             })
 
     manifest_path = output_dir / f"{name}__ring_ensemble.json"

@@ -44,6 +44,7 @@ from src.step7_advanced import (
     detect_catalytic_cys,
     enforce_capability_gate,
     evaluate_redocking_control,
+    resolve_replicate_seeds,
     run_optional_plip,
     write_admet_report,
     write_chemical_state_report,
@@ -198,6 +199,7 @@ def run(
     root = config_path.parent.parent
     config = load_config(config_path)
     configure_logging(config["project"].get("log_level", "INFO"))
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     all_receptors = discover_raw_receptors(root, config, cli_receptors=cli_receptors)
     if not all_receptors:
         raise FileNotFoundError("No receptor PDB found in config or data/01_raw_receptors/.")
@@ -469,6 +471,7 @@ def run(
         json.dumps(
             {
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
                 "config_path": str(config_path),
                 "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
                 "mechanism": mechanism_info,
@@ -500,6 +503,17 @@ def run(
         encoding="utf-8",
     )
     append_run_history(root, json.loads((root / "reports" / "run_manifest.json").read_text(encoding="utf-8")))
+    if not skip_vina:
+        # Each docking run starts from an empty result table; previous summaries
+        # are archived instead of being silently merged across receptors/boxes.
+        archive_dir = root / "reports" / "archive"
+        for summary_name in ("docking_summary.csv", "consensus_summary.csv", "multi_box_results.csv", "ensemble_consensus.csv"):
+            existing_summary = root / "reports" / summary_name
+            if existing_summary.is_file():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(existing_summary, archive_dir / f"{existing_summary.stem}_{run_id}.csv")
+                existing_summary.unlink()
+                LOGGER.info("Archived previous %s to %s", summary_name, archive_dir)
     if gate["manual_review_ligands"] or gate["enzyme_review_flags"]:
         LOGGER.warning("Capability review required before biological interpretation.")
     if advanced.get("replicates", {}).get("count", 1) > 1:
@@ -513,8 +527,16 @@ def run(
     multi_box_rows: list[dict] = []
     ensemble_rows: list[dict] = []
 
-    def _process_single_ligand(ligand: dict) -> None:
+    failures: list[dict] = []
+
+    def _process_ligand(ligand: dict) -> None:
         ligand_assessment = next((row for row in compatibility if row["name"] == ligand["name"]), {})
+        replicate_count = int(advanced.get("replicates", {}).get("count", 1))
+        replicate_seeds = resolve_replicate_seeds(
+            replicate_count,
+            advanced.get("replicates", {}).get("seeds", []),
+        )
+        default_seed = replicate_seeds[0] if replicate_seeds else None
         lig_file_path = resolve_path(root, str(ligand.get("file") or ligand.get("mol2"))) if (ligand.get("file") or ligand.get("mol2")) else None
         pdbqt = prepare_ligand(
             ligand["name"],
@@ -560,11 +582,12 @@ def run(
                     config["vina"]["executable"], rigid_receptor_pdbqt, conformer_path, box,
                     root / "data" / "05_docking_outputs" / "polysaccharides",
                     conformer_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
-                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
+                    config["vina"]["energy_range"], default_seed, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
                 )
                 conformer_summary = score_docking(
                     sugar_output, cleaned, ligand["name"], config,
                     root / "reports" / "polysaccharides" / conformer_name,
+                    run_id=run_id, seed=default_seed,
                 )
                 conformer_summary["Conformer"] = conformer_name
                 conformer_rows.append(conformer_summary)
@@ -592,11 +615,12 @@ def run(
                     config["vina"]["executable"], rigid_receptor_pdbqt, var_pdbqt, box,
                     root / "data" / "05_docking_outputs" / "variants",
                     var_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
-                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
+                    config["vina"]["energy_range"], default_seed, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
                 )
                 var_sum = score_docking(
                     var_out, cleaned, ligand["name"], config,
                     root / "reports" / "variants" / var_name,
+                    run_id=run_id, seed=default_seed,
                 )
                 if best_var_summary is None or _pose_rank_key(var_sum) < _pose_rank_key(best_var_summary):
                     best_var_summary = var_sum
@@ -614,11 +638,12 @@ def run(
                     config["vina"]["executable"], rigid_receptor_pdbqt, active_ligand_pdbqt, cand_box,
                     root / "data" / "05_docking_outputs" / "multi_box",
                     box_run_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"],
-                    config["vina"]["energy_range"], None, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
+                    config["vina"]["energy_range"], default_seed, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt,
                 )
                 box_sum = score_docking(
                     box_out, cleaned, ligand["name"], config,
                     root / "reports" / "multi_box" / box_run_name,
+                    run_id=run_id, seed=default_seed,
                 )
                 box_sum["Box_Name"] = box_name
                 with _SUMMARY_LOCK:
@@ -627,14 +652,12 @@ def run(
                     best_box_summary = box_sum
                     selected_box = cand_box
 
-        replicate_count = int(advanced.get("replicates", {}).get("count", 1))
-        seeds = advanced.get("replicates", {}).get("seeds", [])
         replicate_rows = []
         best_rep_output: Path | None = None
         best_rep_summary: dict | None = None
+        best_rep_seed: int | None = None
 
-        for replicate in range(max(1, replicate_count)):
-            seed = seeds[replicate % len(seeds)] if seeds else None
+        for replicate, seed in enumerate(replicate_seeds):
             run_name = ligand["name"] if replicate_count == 1 else f'{ligand["name"]}__rep{replicate + 1}'
             rep_output, _ = (run_vina_ensemble(config["vina"]["executable"], rigid_receptor_pdbqt, ring_conformers, selected_box, root / "data" / "05_docking_outputs", run_name, config["vina"]["exhaustiveness"], config["vina"]["num_modes"], config["vina"]["energy_range"], seed, use_cache=use_cache, flex_pdbqt=flex_receptor_pdbqt) if len(ring_conformers) > 1 else run_vina(
                 config["vina"]["executable"],
@@ -657,13 +680,17 @@ def run(
                     ligand["name"],
                     config,
                     root / "reports" / "replicates" / run_name,
+                    run_id=run_id,
+                    seed=seed,
                 )
                 replicate_rows.append(replicate_summary)
                 if best_rep_summary is None or _pose_rank_key(replicate_summary) < _pose_rank_key(best_rep_summary):
                     best_rep_summary = replicate_summary
                     best_rep_output = rep_output
+                    best_rep_seed = seed
             else:
                 best_rep_output = rep_output
+                best_rep_seed = seed
 
         assert best_rep_output is not None
         canonical_output = root / "data" / "05_docking_outputs" / f"{ligand['name']}_out.pdbqt"
@@ -677,18 +704,31 @@ def run(
             output = best_rep_output
 
         with _SUMMARY_LOCK:
-            summary = score_docking(output, cleaned, ligand["name"], config, root / "reports")
+            summary = score_docking(
+                output, cleaned, ligand["name"], config, root / "reports",
+                run_id=run_id, seed=best_rep_seed,
+            )
             summary["Receptor"] = receptor_input.stem
             ensemble_rows.append(dict(summary))
 
+        refinement_cfg = advanced.get("pose_refinement", {})
         refined_pose_path = root / "reports" / "active_poses" / f"{ligand['name']}_refined.pdb"
-        refinement_info = refine_active_pose_in_pocket(
-            Path(summary["active_pose"]),
-            refined_pose_path,
-            catalytic_resseq=cat_num,
-        )
-        # If in-pocket L-BFGS-B rigid+torsion refinement improved pocket energy, propagate refined coordinates into active_pose for all downstream analyses
-        if refinement_info.get("refined") and float(refinement_info.get("energy_improvement_kcal", 0.0)) > 0.0 and refined_pose_path.is_file():
+        if refinement_cfg.get("enabled", True):
+            refinement_info = refine_active_pose_in_pocket(
+                Path(summary["active_pose"]),
+                refined_pose_path,
+                catalytic_resseq=cat_num,
+            )
+        else:
+            refinement_info = {"refined": False, "reason": "disabled_by_config"}
+        # The heuristic refinement score is not a physical energy, so the refined
+        # pose only replaces the docked pose when the user explicitly opts in.
+        if (
+            refinement_cfg.get("propagate_to_downstream", False)
+            and refinement_info.get("refined")
+            and float(refinement_info.get("score_improvement", 0.0)) > 0.0
+            and refined_pose_path.is_file()
+        ):
             shutil.copyfile(refined_pose_path, Path(summary["active_pose"]))
 
         with _SUMMARY_LOCK:
@@ -700,7 +740,7 @@ def run(
                     df_sum.insert(0, "Receptor", receptor_input.stem)
                 else:
                     df_sum.loc[mask, "Receptor"] = receptor_input.stem
-                df_sum.loc[mask, "Refinement_Delta_E_kcal"] = round(float(refinement_info.get("energy_improvement_kcal", 0.0)), 3)
+                df_sum.loc[mask, "Refinement_Delta_Score"] = round(float(refinement_info.get("score_improvement", 0.0)), 3)
                 df_sum.loc[mask, "Refinement_RMSD_A"] = round(float(refinement_info.get("refinement_rmsd_A", 0.0)), 4)
                 df_sum.to_csv(summary_csv_path, index=False)
 
@@ -709,6 +749,8 @@ def run(
             root / "reports" / "interactions" / f'{ligand["name"]}_interactions.csv',
             cat_num,
             target_chain=config["receptor"]["chain_id"],
+            max_catalytic_attack_A=float(config.get("thresholds", {}).get("d_nuc_max", 4.5)),
+            max_hydride_transfer_A=float(config.get("thresholds", {}).get("d_hyd_max", 5.0)),
         )
         update_interaction_summary(root / "reports" / "docking_summary.csv", ligand["name"], interactions)
         try:
@@ -722,10 +764,16 @@ def run(
                 png_width=int(config.get("visualization", {}).get("png_width", 2400)),
                 png_height=int(config.get("visualization", {}).get("png_height", 1800)),
             )
-        except FileNotFoundError as exc:
-            LOGGER.warning("PyMOL not available; script was not rendered: %s", exc)
+        except Exception as exc:  # rendering is optional and must not abort the batch
+            LOGGER.warning(
+                "PyMOL rendering unavailable for %s (%s: %s); a fallback figure is used when matplotlib is available.",
+                ligand["name"], type(exc).__name__, exc,
+            )
         if advanced.get("plip", {}).get("enabled"):
-            run_optional_plip(Path(summary["active_pose"]), root / "reports" / "plip", advanced["plip"].get("executable", "plip"))
+            try:
+                run_optional_plip(Path(summary["active_pose"]), root / "reports" / "plip", advanced["plip"].get("executable", "plip"))
+            except Exception as exc:
+                LOGGER.warning("Optional PLIP cross-check failed for %s: %s", ligand["name"], exc)
         if advanced.get("md", {}).get("enabled"):
             write_md_setup(Path(summary["active_pose"]), root / "reports" / "md", advanced["md"])
         if advanced.get("qmmm", {}).get("enabled"):
@@ -734,6 +782,18 @@ def run(
             flag.endswith("requires_covalent_docking_or_qm_mm") for flag in ligand_assessment.get("flags", [])
         ):
             build_covalent_complex_and_manifest(Path(summary["active_pose"]), config, root / "reports" / "covalent")
+
+    def _process_single_ligand(ligand: dict) -> None:
+        try:
+            _process_ligand(ligand)
+        except Exception as exc:  # isolate per-ligand failures so one bad input cannot abort the batch
+            LOGGER.exception("Ligand %s failed; continuing with remaining ligands.", ligand.get("name"))
+            with _SUMMARY_LOCK:
+                failures.append({
+                    "Ligand": ligand.get("name"),
+                    "Error_Type": type(exc).__name__,
+                    "Error": str(exc),
+                })
 
     if workers > 1 and len(config["ligands"]) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -744,10 +804,15 @@ def run(
         for ligand in config["ligands"]:
             _process_single_ligand(ligand)
 
+    if failures:
+        failure_path = root / "reports" / "ligand_failures.json"
+        failure_path.write_text(json.dumps(failures, indent=2), encoding="utf-8")
+        LOGGER.error("%d ligand(s) failed; see %s", len(failures), failure_path)
     if multi_box_rows:
         aggregate_multi_box_results(multi_box_rows, root / "reports" / "multi_box_results.csv")
 
     if not skip_vina and advanced.get("receptor_ensemble", {}).get("enabled"):
+        ensemble_seed = resolve_replicate_seeds(1, advanced.get("replicates", {}).get("seeds", []))[0]
         for ens_idx, ens_input in enumerate(advanced.get("receptor_ensemble", {}).get("inputs", []), start=2):
             ens_path = resolve_path(root, ens_input)
             if not ens_path.is_file():
@@ -786,7 +851,7 @@ def run(
                     config["vina"]["exhaustiveness"],
                     config["vina"]["num_modes"],
                     config["vina"]["energy_range"],
-                    None,
+                    ensemble_seed,
                     use_cache=use_cache,
                 )
                 ens_rep_dir = root / "reports" / "ensemble" / ens_stem
@@ -796,17 +861,30 @@ def run(
                     ligand["name"],
                     config,
                     ens_rep_dir,
+                    run_id=run_id,
+                    seed=ensemble_seed,
                 )
                 ens_sum["Receptor"] = ens_stem
                 ens_refined = ens_rep_dir / "active_poses" / f"{ligand['name']}_refined.pdb"
-                ens_ref_info = refine_active_pose_in_pocket(Path(ens_sum["active_pose"]), ens_refined, catalytic_resseq=cat_num)
-                if ens_ref_info.get("refined") and float(ens_ref_info.get("energy_improvement_kcal", 0.0)) > 0.0 and ens_refined.is_file():
+                ens_refinement_cfg = advanced.get("pose_refinement", {})
+                if ens_refinement_cfg.get("enabled", True):
+                    ens_ref_info = refine_active_pose_in_pocket(Path(ens_sum["active_pose"]), ens_refined, catalytic_resseq=cat_num)
+                else:
+                    ens_ref_info = {"refined": False, "reason": "disabled_by_config"}
+                if (
+                    ens_refinement_cfg.get("propagate_to_downstream", False)
+                    and ens_ref_info.get("refined")
+                    and float(ens_ref_info.get("score_improvement", 0.0)) > 0.0
+                    and ens_refined.is_file()
+                ):
                     shutil.copyfile(ens_refined, Path(ens_sum["active_pose"]))
                 ens_inter = analyze_interactions(
                     Path(ens_sum["active_pose"]),
                     ens_rep_dir / "interactions" / f"{ligand['name']}_interactions.csv",
                     cat_num,
                     target_chain=config["receptor"]["chain_id"],
+                    max_catalytic_attack_A=float(config.get("thresholds", {}).get("d_nuc_max", 4.5)),
+                    max_hydride_transfer_A=float(config.get("thresholds", {}).get("d_hyd_max", 5.0)),
                 )
                 update_interaction_summary(ens_rep_dir / "docking_summary.csv", ligand["name"], ens_inter)
                 ensemble_rows.append(dict(ens_sum))

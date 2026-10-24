@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.common import (
     PDBParser,
+    atom_dict,
     compute_peoe_charges,
     enumerate_ph_protonation_states,
     enumerate_stereoisomers_and_tautomers,
@@ -25,7 +26,7 @@ from src.common import (
     write_fallback_pdbqt,
 )
 from src.mechanism_templates import list_supported_mechanisms, load_mechanism_template, mechanism_capability
-from src.step10_evaluation import _bedroc, _enrichment_factor, _pr_auc, _roc_auc, evaluate_experimental_data
+from src.step10_evaluation import _bedroc, _enrichment_factor, _pr_auc, _roc_auc, _spearman, evaluate_experimental_data
 from src.step6_interaction_viz import analyze_interactions
 from src.step1_ligand_prep import discover_raw_ligands, enumerate_ligand_variants, prepare_ligand, prepare_polysaccharide_conformers, prepare_ring_conformer_ensemble
 from src.step2_receptor_prep import (
@@ -54,6 +55,7 @@ from src.step7_advanced import (
     detect_catalytic_cys,
     enforce_capability_gate,
     evaluate_redocking_control,
+    resolve_replicate_seeds,
 )
 from src.step8_dynamics import refine_active_pose_in_pocket, write_md_setup
 from src.step9_qmmm import write_qmmm_input
@@ -430,7 +432,7 @@ class GeometryTests(unittest.TestCase):
             cap = mechanism_capability(tmpl)
             self.assertTrue(cap["implemented_scoring"], f"{family} should have implemented_scoring=True")
 
-    def test_adaptive_cofactor_conformation_scores_contracted_nad_pose(self):
+    def test_contracted_nad_pose_is_reported_but_not_competent(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             receptor_path = root / "receptor.pdb"
@@ -463,13 +465,15 @@ class GeometryTests(unittest.TestCase):
                     "d_nuc_min": 3.0,
                     "d_nuc_max": 4.5,
                     "d_hyd_max": 4.5,
-                    "adaptive_cofactor_hydride_max": True,
                 },
             }
             res = score_docking(docking_path, receptor_path, "Octanal", config, root / "reports")
-            self.assertTrue(res["Catalytically_Competent"])
+            self.assertFalse(res["Catalytically_Competent"])
+            self.assertFalse(res["Hydride_Transfer_Competent"])
+            self.assertTrue(res["Nucleophile_Competent"])
             self.assertEqual(res["Cofactor_Conformation"], "contracted_hydrolysis_out")
-            self.assertEqual(res["Reliability_Grade"], "A_High_Confidence_Catalytic")
+            self.assertEqual(res["Effective_d_hyd_Max_A"], 4.5)
+            self.assertEqual(res["Reliability_Grade"], "C_Low_Confidence_Affinity_Fallback")
             self.assertIn("PhysChem_Score_kcal_mol", res)
             self.assertIn("Universal_Consensus_Rank", res)
 
@@ -580,7 +584,7 @@ class GeometryTests(unittest.TestCase):
 
             refinement = refine_active_pose_in_pocket(pose, root / "complex_refined.pdb", catalytic_resseq=302)
             self.assertTrue(refinement["refined"])
-            self.assertLessEqual(refinement["refined_pocket_energy_kcal"], refinement["initial_pocket_energy_kcal"])
+            self.assertLessEqual(refinement["refined_pocket_score"], refinement["initial_pocket_score"])
 
     def test_flex_output_parsing_separates_flex_residues_from_ligand_and_merges(self):
         with TemporaryDirectory() as directory:
@@ -665,7 +669,7 @@ class GeometryTests(unittest.TestCase):
             res = refine_active_pose_in_pocket(pose, root / "refined.pdb", catalytic_resseq=302)
             self.assertTrue(res["refined"])
             self.assertGreaterEqual(res["optimized_torsion_count"], 1)
-            self.assertLess(res["refined_pocket_energy_kcal"], res["initial_pocket_energy_kcal"])
+            self.assertLess(res["refined_pocket_score"], res["initial_pocket_score"])
 
     def test_peoe_topological_charges_and_coupled_zwitterion_microstates(self):
         parsed = parse_smiles_tokens("CCC=O")
@@ -859,12 +863,26 @@ class GeometryTests(unittest.TestCase):
                 _pdb_atom("ATOM", 2, "ND2", "ASN", "A", 169, 2.8, 0.0, 0.0, "N"),
                 _pdb_atom("ATOM", 3, "NZ", "LYS", "A", 192, 0.0, 5.8, 0.0, "N"),
                 _pdb_atom("ATOM", 4, "CG", "PHE", "A", 401, 0.0, 0.0, 3.7, "C"),
+                # Full aromatic ring for pi-stacking (centroid 10,10,13.7)
+                _pdb_atom("ATOM", 20, "CG", "PHE", "A", 402, 11.4, 10.0, 13.7, "C"),
+                _pdb_atom("ATOM", 21, "CD1", "PHE", "A", 402, 10.7, 11.212, 13.7, "C"),
+                _pdb_atom("ATOM", 22, "CD2", "PHE", "A", 402, 9.3, 11.212, 13.7, "C"),
+                _pdb_atom("ATOM", 23, "CE1", "PHE", "A", 402, 8.6, 10.0, 13.7, "C"),
+                _pdb_atom("ATOM", 24, "CE2", "PHE", "A", 402, 9.3, 8.788, 13.7, "C"),
+                _pdb_atom("ATOM", 25, "CZ", "PHE", "A", 402, 10.7, 8.788, 13.7, "C"),
                 _pdb_atom("HETATM", 5, "ZN", "ZN", "A", 601, -2.1, 0.0, 0.0, "ZN"),
                 # Ligand with TWO polar oxygens O1 and O2, aromatic/aliphatic C1, and Cl1 halogen
                 _pdb_atom("HETATM", 10, "O1", "LIG", "L", 999, 0.0, 0.0, 0.0, "O"),
                 _pdb_atom("HETATM", 11, "C1", "LIG", "L", 999, 1.2, 0.0, 0.0, "C"),
                 _pdb_atom("HETATM", 12, "O2", "LIG", "L", 999, 0.0, 3.0, 0.0, "O"),
                 _pdb_atom("HETATM", 13, "CL1", "LIG", "L", 999, 2.8, 3.1, 0.0, "CL"),
+                # Planar six-membered ligand ring (centroid 10,10,10), parallel to PHE402
+                _pdb_atom("HETATM", 30, "C10", "LIG", "L", 999, 11.4, 10.0, 10.0, "C"),
+                _pdb_atom("HETATM", 31, "C11", "LIG", "L", 999, 10.7, 11.212, 10.0, "C"),
+                _pdb_atom("HETATM", 32, "C12", "LIG", "L", 999, 9.3, 11.212, 10.0, "C"),
+                _pdb_atom("HETATM", 33, "C13", "LIG", "L", 999, 8.6, 10.0, 10.0, "C"),
+                _pdb_atom("HETATM", 34, "C14", "LIG", "L", 999, 9.3, 8.788, 10.0, "C"),
+                _pdb_atom("HETATM", 35, "C15", "LIG", "L", 999, 10.7, 8.788, 10.0, "C"),
                 "END",
             ]) + "\n", encoding="utf-8")
             df = analyze_interactions(complex_pdb, root / "inter.csv", 302, target_chain="A")
@@ -943,8 +961,10 @@ class GeometryTests(unittest.TestCase):
     def test_refined_pose_propagation_records_refinement_delta_e_and_rmsd(self):
         import pandas as pd
         df = pd.read_csv(Path(__file__).resolve().parents[1] / "reports" / "docking_summary.csv")
-        self.assertIn("Refinement_Delta_E_kcal", df.columns)
+        self.assertIn("Refinement_Delta_Score", df.columns)
         self.assertIn("Refinement_RMSD_A", df.columns)
+        self.assertIn("Run_ID", df.columns)
+        self.assertIn("Seed", df.columns)
 
 
     def test_mol2_single_and_multimol_parsing_preserves_3d_coords_and_charges(self):
@@ -1170,6 +1190,77 @@ ATOM 6 S SG . CYS A 302 4.750 1.100 1.900 1.00 15.00 1
         self.assertTrue(html_report.is_file())
         df_sum = pd.read_csv(summary_csv)
         self.assertIn("Receptor", df_sum.columns)
+
+
+    def test_pdbqt_atom_type_column_maps_aromatic_carbon_and_halogens(self):
+        pdbqt_line = "ATOM      1  C   UNL     1       1.000   2.000   3.000  1.00  0.00     0.115 A "
+        atom = atom_dict(pdbqt_line)
+        self.assertEqual(atom["element"], "C")
+        self.assertTrue(atom["aromatic"])
+        self.assertEqual(atom["type"], "A")
+
+        pdb_line = _pdb_atom("ATOM", 1, "CL1", "LIG", "L", 999, 0.0, 0.0, 0.0, "CL")
+        self.assertEqual(atom_dict(pdb_line.rstrip("\n"))["element"], "CL")
+
+    def test_clean_ligand_pdbqt_writes_aromatic_carbon_as_element_c(self):
+        model = [{
+            "name": "C1",
+            "element": "C",
+            "type": "A",
+            "aromatic": True,
+            "serial": 1,
+            "coord": [0.0, 0.0, 0.0],
+            "resname": "LIG",
+            "chain": "L",
+            "resseq": 999,
+        }]
+        line = clean_ligand_pdbqt(model)[0]
+        self.assertEqual(line[76:78].strip(), "C")
+
+    def test_replicate_seed_resolution_never_recycles_seeds(self):
+        seeds = resolve_replicate_seeds(5, [101, 202])
+        self.assertEqual(len(seeds), 5)
+        self.assertEqual(len(set(seeds)), 5)
+        self.assertEqual(seeds[:2], [101, 202])
+        self.assertEqual(resolve_replicate_seeds(1, []), [None])
+
+    def test_spearman_uses_average_ranks_for_ties(self):
+        self.assertAlmostEqual(_spearman([1, 1, 2, 2], [1, 2, 3, 4]), 0.894427, places=6)
+
+    def test_box_audit_does_not_require_catalytic_cys_for_general_binding(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdb = root / "receptor.pdb"
+            pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0, "C"),
+                _pdb_atom("ATOM", 2, "CA", "ALA", "A", 2, 5.0, 0.0, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            config = {
+                "receptor": {"chain_id": "A", "catalytic_residue": {}, "keep_cofactors": []},
+                "enzyme": {"mechanism_family": "general_binding"},
+            }
+            box = {"center_x": 0.0, "center_y": 0.0, "center_z": 0.0, "size_x": 20.0, "size_y": 20.0, "size_z": 20.0}
+            result = audit_docking_box(pdb, box, config, root / "audit.json")
+            self.assertNotIn("catalytic_cys_sg_not_found_for_box_audit", result["flags"])
+
+    def test_interaction_cutoffs_and_aromaticity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            complex_pdb = root / "complex.pdb"
+            complex_pdb.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 20.0, 0.0, 0.0, "S"),
+                _pdb_atom("ATOM", 2, "C4N", "NAD", "A", 5501, 25.0, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 3, "O1", "LIG", "L", 999, 0.0, 0.0, 0.0, "O"),
+                _pdb_atom("HETATM", 4, "C1", "LIG", "L", 999, 1.2, 0.0, 0.0, "C"),
+                _pdb_atom("HETATM", 5, "C2", "LIG", "L", 999, 2.7, 0.0, 0.0, "C"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            frame = analyze_interactions(complex_pdb, root / "inter.csv", 302, target_chain="A")
+            types = set(frame["Type"].tolist())
+            self.assertNotIn("Catalytic_Attack", types)
+            self.assertNotIn("Hydride_Transfer", types)
+            self.assertNotIn("Pi_Stacking", types)
 
 
 if __name__ == "__main__":

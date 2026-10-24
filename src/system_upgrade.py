@@ -367,7 +367,8 @@ def append_run_history(project_root: Path, manifest: dict) -> None:
         tmp_db = Path(tmpdir) / "run_history.sqlite3"
         if db_path.is_file() and db_path.stat().st_size > 0:
             shutil.copyfile(db_path, tmp_db)
-        with sqlite3.connect(tmp_db) as connection:
+        connection = sqlite3.connect(tmp_db)
+        try:
             connection.execute("PRAGMA journal_mode=MEMORY")
             connection.execute("PRAGMA synchronous=OFF")
             connection.execute(
@@ -384,6 +385,10 @@ def append_run_history(project_root: Path, manifest: dict) -> None:
                 ),
             )
             connection.commit()
+        finally:
+            # Windows keeps the database locked until the connection closes, which
+            # would make TemporaryDirectory cleanup fail with WinError 32.
+            connection.close()
         db_path.write_bytes(tmp_db.read_bytes())
 
 
@@ -400,24 +405,29 @@ def write_system_coverage_report(project_root: Path, config: dict, output_json: 
         ("multi_engine_consensus", "implemented_peoe_physchem_rescorer_and_borda_rank_consensus", "engine_consensus_plan.json"),
         ("polysaccharide", "implemented_conformer_ensemble_and_gate_layer", "ligand_compatibility.json"),
         ("covalent", "implemented_sp2_to_sp3_tetrahedral_adduct_builder", "workflow_readiness.json"),
-        ("md_plip_qmmm", "implemented_rigid_plus_torsion_lbfgsb_refinement_and_qmmm_xyz", "workflow_readiness.json"),
+        ("md_plip_qmmm", "preparation_and_interface_only_external_execution_required", "workflow_readiness.json"),
         ("experimental_calibration", "implemented_auto_evaluation_and_bootstrap_ci", "evaluation_results.csv"),
         ("gui_analysis", "implemented_4_tab_workbench_with_interactive_3d_canvas", "run_history.sqlite3"),
         ("project_history_recovery", "implemented_sha256_checkpoint_cache_and_sqlite_history", "run_history.sqlite3"),
     ]
+    external_required = {"md_plip_qmmm", "polysaccharide"}
     coverage = []
     for name, status, artifact in items:
         coverage.append({
             "item": name,
             "status": status,
             "artifact": str(project_root / "reports" / artifact),
-            "external_validation_required": False,
+            "external_validation_required": name in external_required,
         })
     result = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "count": len(coverage),
         "items": coverage,
-        "interpretation": "All 14 pipeline modules have active in-pipeline computational execution and audit coverage.",
+        "interpretation": (
+            "Items marked external_validation_required provide preparation files, plans or gated "
+            "conformer ensembles only; their outputs are not simulation results until the external "
+            "engine is executed and validated."
+        ),
     }
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")

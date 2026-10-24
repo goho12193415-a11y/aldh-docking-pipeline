@@ -8,6 +8,7 @@ data/05_docking_outputs/*
 reports/*.csv
 reports/*.json
 reports/*.sqlite3
+reports/archive/
 reports/active_poses/*
 reports/interactions/*
 reports/figures/*

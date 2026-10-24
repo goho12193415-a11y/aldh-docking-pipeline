@@ -350,7 +350,7 @@ class DockingWorkbench(tk.Tk):
         self.exhaustiveness_var = tk.StringVar(value="16")
         self.num_modes_var = tk.StringVar(value="20")
         self.replicates_var = tk.StringVar(value="1")
-        self.adaptive_hyd_var = tk.BooleanVar(value=True)
+        self.refine_propagate_var = tk.BooleanVar(value=False)
         self.dock_variants_var = tk.BooleanVar(value=False)
         self.auto_pockets_var = tk.BooleanVar(value=False)
 
@@ -572,7 +572,7 @@ class DockingWorkbench(tk.Tk):
 
         opt_row = ttk.Frame(page, style="Card.TFrame")
         opt_row.grid(row=3, column=2, columnspan=4, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(opt_row, text="辅因子 in/out 自适应", variable=self.adaptive_hyd_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(opt_row, text="精修构象用于下游分析（默认不覆盖对接构象）", variable=self.refine_propagate_var).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(opt_row, text="对接全部微态变体", variable=self.dock_variants_var).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(opt_row, text="全蛋白自动发现多口袋", variable=self.auto_pockets_var).pack(side="left", padx=(0, 10))
         ttk.Button(opt_row, text="保存并启动对接", style="Primary.TButton", command=self._save_and_run).pack(side="left")
@@ -704,7 +704,7 @@ class DockingWorkbench(tk.Tk):
             self.replicates_var.set(str(adv.get("replicates", {}).get("count", 1)))
             self.auto_cys_var.set(bool(adv.get("auto_detect_catalytic_cys", False)))
             self.dock_variants_var.set(bool(adv.get("ligand_variants", {}).get("dock_variants", False)))
-            self.adaptive_hyd_var.set(bool(cfg.get("thresholds", {}).get("adaptive_cofactor_hydride_max", True)))
+            self.refine_propagate_var.set(bool(adv.get("pose_refinement", {}).get("propagate_to_downstream", False)))
         except Exception as exc:
             self._append(f"[WARN] 读取配置失败: {exc}\n")
 
@@ -736,9 +736,9 @@ class DockingWorkbench(tk.Tk):
         cfg["docking_box"]["auto_discover_pockets"] = bool(self.auto_pockets_var.get())
         cfg.setdefault("vina", {})["exhaustiveness"] = int(self.exhaustiveness_var.get().strip() or 16)
         cfg["vina"]["num_modes"] = int(self.num_modes_var.get().strip() or 20)
-        cfg.setdefault("thresholds", {})["adaptive_cofactor_hydride_max"] = bool(self.adaptive_hyd_var.get())
         adv = cfg.setdefault("advanced", {})
         adv["auto_detect_catalytic_cys"] = bool(self.auto_cys_var.get())
+        adv.setdefault("pose_refinement", {})["propagate_to_downstream"] = bool(self.refine_propagate_var.get())
         adv.setdefault("replicates", {})["count"] = int(self.replicates_var.get().strip() or 1)
         adv.setdefault("ligand_variants", {})["dock_variants"] = bool(self.dock_variants_var.get())
         with cfg_path.open("w", encoding="utf-8") as handle:

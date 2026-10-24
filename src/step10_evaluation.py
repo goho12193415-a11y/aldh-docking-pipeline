@@ -143,10 +143,18 @@ def _spearman(x, y) -> float:
 
 
 def _ranks(values):
+    """Average ranks for ties (required for a correct Spearman correlation)."""
     order = sorted(range(len(values)), key=lambda index: values[index])
     ranks = [0.0] * len(values)
-    for rank, index in enumerate(order, 1):
-        ranks[index] = float(rank)
+    position = 0
+    while position < len(order):
+        end = position
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[position]]:
+            end += 1
+        average_rank = (position + end + 2) / 2.0  # 1-based average of position+1..end+1
+        for pointer in range(position, end + 1):
+            ranks[order[pointer]] = average_rank
+        position = end + 1
     return ranks
 
 
