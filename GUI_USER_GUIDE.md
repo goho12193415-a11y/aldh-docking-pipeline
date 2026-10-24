@@ -79,11 +79,16 @@ python scripts\quick_start.py --receptor data\01_raw_receptors\receptor.pdb --li
 - `reports\receptor_state.json`：受体 alternate location、辅因子、金属和水审计；
 - `reports\run_manifest.json`：本次配置指纹、机制模板和运行模式；
 - `data\04_prepped_ligands\polysaccharides\`：多糖构象集合和 manifest；
-- `reports\polysaccharides\`：多糖逐构象对接结果。
+- `reports\polysaccharides\`：多糖逐构象对接结果；
+- `reports\live_pose_stream.json`：运行期实时 3D 流，GUI 右下角的速写窗跟随它刷新；
+- `reports\active_poses\<ligand>_trajectory.json`：多 mode + 精修终态的构象回放帧；
+- `reports\对接结果可视化总览报告.html`：内嵌 3D 帧间插值播放器，点击表格行可切换分子。
 
 ## 5. 如何解释结果
 
 `Catalytically_Competent=True` 仅表示该构象满足当前配置的几何筛选，不等于真实酶活性。`Affinity_Fallback_No_Catalytic_Pose` 表示没有构象满足严格催化几何，只导出了最低 Vina 能量参考构象。
+
+通用靶点（`general_binding`）使用 `Binding_Pose_Supported` / `Affinity_Fallback_No_Supported_Pose`，可靠性等级为 `A_PhysChem_Supported_Pose`；这里的“支持”指物理化学打分和口袋接触，不是催化活性。Live3D 的“轨迹”是 Vina 多 mode + 精修终态的回放，不是 MD 时间序列。
 
 对于多糖、金属配合物、自由基、强多电荷体系、潜在共价抑制剂、超大柔性配体，必须先阅读 `ligand_compatibility.json` 和 `capability_report.json`。如果出现 `specialized_method_required` 或 `block_interpretation`，不能只依据 Vina 分数下结论。
 

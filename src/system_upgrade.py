@@ -450,10 +450,10 @@ def write_system_coverage_report(project_root: Path, config: dict, output_json: 
 
 
 def _extract_pose_json_for_viewer(pose_pdb: Path, catalytic_num: int = 302) -> dict:
-    """Extract compact JSON-serializable 3D coordinates of ligand, catalytic residue, cofactor, and pocket for the embedded HTML5 3D canvas viewer."""
+    """Extract compact JSON-serializable 3D coordinates of ligand, multi-mode trajectory frames, catalytic residue, cofactor, and pocket."""
     lig, cat, cof, all_rec = [], [], [], []
     if not pose_pdb.is_file():
-        return {"lig": [], "cat": [], "cof": [], "pocket": []}
+        return {"lig": [], "frames": [], "cat": [], "cof": [], "pocket": []}
     for line in pose_pdb.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith(("ATOM", "HETATM")):
             continue
@@ -496,9 +496,36 @@ def _extract_pose_json_for_viewer(pose_pdb: Path, catalytic_num: int = 302) -> d
         r for r in cof
         if math.sqrt((r["x"] - center[0]) ** 2 + (r["y"] - center[1]) ** 2 + (r["z"] - center[2]) ** 2) <= 10.0
     ]
+
+    # Load multi-mode search + L-BFGS-B refinement trajectory frames if available
+    frames = []
+    traj_Stem = pose_pdb.stem.replace("_active", "").replace("_refined", "")
+    traj_file = pose_pdb.parent / f"{traj_Stem}_trajectory.json"
+    if traj_file.is_file():
+        try:
+            tdata = json.loads(traj_file.read_text(encoding="utf-8"))
+            frames = tdata.get("frames", [])
+        except Exception:
+            frames = []
+    if not frames and lig:
+        frames = [{
+            "frame_label": "最优锁定构象",
+            "mode": 1,
+            "stage": "final",
+            "is_best_selected": True,
+            "competent": True,
+            "vina_kcal": "",
+            "physchem_kcal": "",
+            "d_nuc_A": "",
+            "d_hyd_A": "",
+            "angle_deg": "",
+            "lig": lig,
+        }]
+
     return {
         "center": [round(float(v), 3) for v in center],
         "lig": lig,
+        "frames": frames,
         "cat": cat,
         "cof": cof_near,
         "pocket": pocket[:60],
@@ -506,7 +533,7 @@ def _extract_pose_json_for_viewer(pose_pdb: Path, catalytic_num: int = 302) -> d
 
 
 def generate_visual_html_report(project_root: Path, output_html: Path | None = None, catalytic_num: int = 302) -> Path:
-    """Generate a hand-drawn scientific sketchbook HTML folio (纸本钢笔淡彩实验手札) with SVG ink filters, carved seal badges, and an ink-and-wash 3D molecular canvas."""
+    """Generate a hand-drawn scientific sketchbook HTML folio with real-time 3D conformational search & L-BFGS-B refinement trajectory animation."""
     reports_dir = project_root / "reports"
     summary_csv = reports_dir / "docking_summary.csv"
     admet_csv = reports_dir / "admet_druglikeness.csv"
@@ -558,7 +585,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
           <p>
             经口袋几何尺规与热力学联测，<strong>{top_lig}</strong> 在活性腔内呈现最稳固的近进攻构象（Near-Attack Conformation）。
             其结合自由能估值为 <strong>{top_aff} kcal/mol</strong>，反应原子距口袋关键中心 <strong>{top_dnuc} Å</strong>，
-            并与周围残基（<strong>{top_hb}</strong>）形成稳定的非共价锚定网络。
+            并与周围残基（<strong>{top_hb}</strong>）形成稳定的非共价锚定网络。下方速写台正在实时推演其多构象搜寻与 L-BFGS-B 能量精修轨迹。
           </p>
         </section>
         """
@@ -575,8 +602,9 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
         else:
             seal_cls, seal_txt = "seal-c", "丙等 · 寻常结合"
         comp_txt = "支持 (True)" if str(r.get("Catalytically_Competent")) == "True" else "未支持 (False)"
+        lig_k = f"{r.get('Receptor', 'primary')} · {r.get('Ligand', '')}" if len({x.get("Receptor", "") for x in ordered_rows}) > 1 else str(r.get("Ligand", ""))
         score_trs.append(f"""
-        <tr>
+        <tr onclick="switchPose('{lig_k}')" style="cursor:pointer;" title="点击在上方三维速写台推演该分子构象">
           <td class="num-col">{idx:02d}</td>
           <td>{r.get("Receptor", "receptor")}</td>
           <td><strong class="lig-title">{r.get("Ligand", "")}</strong></td>
@@ -620,7 +648,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>分子对接与构象手札 · 实验台账</title>
+  <title>分子对接与构象手札 · 实时三维推演台</title>
   <style>
     :root {{
       --paper: #F6F1E4;
@@ -636,7 +664,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     }}
     * {{ box-sizing: border-box; }}
     body {{
-      margin: 0; padding: 36px 44px;
+      margin: 0; padding: 32px 40px;
       font-family: "Songti SC", "STSong", "Noto Serif SC", "SimSun", "Georgia", serif;
       background-color: var(--paper);
       background-image:
@@ -644,7 +672,7 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
         linear-gradient(to bottom, transparent 31px, rgba(216, 206, 184, 0.35) 32px);
       background-size: 24px 24px, 100% 32px;
       color: var(--ink);
-      line-height: 1.75;
+      line-height: 1.7;
     }}
     .folio-container {{ max-width: 1180px; margin: 0 auto; }}
     .sketch-box {{
@@ -653,8 +681,8 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       border-radius: 3px 8px 4px 7px / 6px 3px 8px 4px;
       box-shadow: 4px 5px 0px rgba(43, 37, 32, 0.14);
       position: relative;
-      padding: 24px 30px;
-      margin-bottom: 28px;
+      padding: 22px 28px;
+      margin-bottom: 26px;
     }}
     .sketch-box::after {{
       content: "";
@@ -664,17 +692,17 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       border-radius: 4px;
     }}
     .masthead {{
-      text-align: center; padding: 28px 24px 22px; margin-bottom: 28px;
+      text-align: center; padding: 24px 24px 18px; margin-bottom: 24px;
       border-bottom: 3px double var(--ink);
     }}
     .masthead .sub-kicker {{
-      font-size: 13px; letter-spacing: 3px; color: var(--ink-muted); text-transform: uppercase;
+      font-size: 12.5px; letter-spacing: 3px; color: var(--ink-muted); text-transform: uppercase;
     }}
     .masthead h1 {{
-      margin: 8px 0 6px; font-size: 30px; font-weight: 700; letter-spacing: 2px; color: var(--ink);
+      margin: 6px 0 4px; font-size: 29px; font-weight: 700; letter-spacing: 2px; color: var(--ink);
     }}
     .masthead p {{
-      margin: 0; font-size: 14.5px; color: var(--ink-muted); font-style: italic;
+      margin: 0; font-size: 14px; color: var(--ink-muted); font-style: italic;
     }}
     .stamp-seal {{
       float: right; border: 2.5px solid var(--cinnabar); color: var(--cinnabar);
@@ -686,30 +714,25 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     .note-meta {{
       font-size: 12.5px; color: var(--ink-muted); letter-spacing: 1.5px; margin-bottom: 4px;
     }}
-    .folio-note h2 {{ margin: 4px 0 10px; font-size: 21px; }}
-    .ink-underline {{
-      border-bottom: 2px wavy var(--cinnabar); padding-bottom: 2px;
-    }}
+    .folio-note h2 {{ margin: 4px 0 8px; font-size: 20px; }}
+    .ink-underline {{ border-bottom: 2px wavy var(--cinnabar); padding-bottom: 2px; }}
     .section-head {{
       display: flex; align-items: baseline; justify-content: space-between;
-      border-bottom: 1.5px solid var(--ink); padding-bottom: 8px; margin-bottom: 14px;
+      border-bottom: 1.5px solid var(--ink); padding-bottom: 8px; margin-bottom: 12px;
     }}
-    .section-head h3 {{ margin: 0; font-size: 19px; letter-spacing: 1px; }}
+    .section-head h3 {{ margin: 0; font-size: 18.5px; letter-spacing: 1px; }}
     .section-head span {{ font-size: 13px; color: var(--ink-muted); }}
     .guide-caption {{
       margin: 0 0 14px; font-size: 13.5px; color: var(--ink-muted);
       background: rgba(216, 206, 184, 0.25); padding: 8px 14px; border-left: 3px solid var(--ink);
     }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-    th, td {{
-      padding: 10px 11px; text-align: left;
-      border-bottom: 1px solid var(--rule-line);
-    }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13.8px; }}
+    th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--rule-line); }}
     th {{
       border-top: 2px solid var(--ink); border-bottom: 2px solid var(--ink);
       background: rgba(216, 206, 184, 0.28); color: var(--ink); font-weight: 700;
     }}
-    tr:hover {{ background: rgba(181, 123, 40, 0.06); }}
+    tr:hover {{ background: rgba(181, 123, 40, 0.08); }}
     .num-col {{ font-family: "Georgia", "Times New Roman", serif; }}
     .lig-title {{ color: var(--indigo); }}
     .ink-seal {{
@@ -720,65 +743,69 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     .seal-b {{ border-color: var(--ochre); color: var(--ochre); background: rgba(181, 123, 40, 0.08); }}
     .seal-c {{ border-color: var(--ink-muted); color: var(--ink-muted); background: rgba(101, 91, 78, 0.06); }}
     .viewer-bar {{
-      display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;
+      display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;
+    }}
+    .timeline-bar {{
+      display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+      padding: 8px 14px; background: rgba(216, 206, 184, 0.28);
+      border: 1px solid var(--ink); border-radius: 3px;
     }}
     select, button {{
-      padding: 6px 14px; font-family: inherit; font-size: 13.5px;
+      padding: 5px 12px; font-family: inherit; font-size: 13px;
       background: var(--paper); color: var(--ink);
       border: 1.5px solid var(--ink); border-radius: 2px; cursor: pointer;
-      box-shadow: 2px 2px 0px rgba(43, 37, 32, 0.18);
+      box-shadow: 2px 2px 0px rgba(43, 37, 32, 0.16);
     }}
-    button:hover {{ background: #EDE4CE; }}
+    button.primary-ink {{
+      background: var(--cinnabar); color: #FBF8F1; border-color: var(--ink); font-weight: 700;
+    }}
+    button:hover {{ background: #EDE4CE; color: var(--ink); }}
+    input[type=range] {{ flex: 1; accent-color: var(--cinnabar); cursor: pointer; }}
     #molCanvas {{
-      width: 100%; height: 460px; background: #F4EFE0;
+      width: 100%; height: 480px; background: #F4EFE0;
       border: 1.5px solid var(--ink); cursor: grab; display: block;
     }}
   </style>
 </head>
 <body>
-  <svg width="0" height="0" style="position:absolute">
-    <filter id="sketch-filter">
-      <feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="3" result="noise" />
-      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.6" />
-    </filter>
-  </svg>
-
   <div class="folio-container">
     <header class="masthead">
-      <div class="sub-kicker">Laboratory Sketchbook &amp; Mechanistic Docking Folio</div>
-      <h1>分子对接与催化构象实验手札</h1>
-      <p>手绘钢笔淡彩视图 · 活性口袋几何尺规 · 物理化学与 Lipinski 成药性台账</p>
+      <div class="sub-kicker">Live 3D Conformational Search &amp; Mechanistic Sketchbook</div>
+      <h1>分子对接与实时三维构象推演手札</h1>
+      <p>实时多构象搜寻轨迹动画 · L-BFGS-B 能量微调演进 · 活性口袋钢笔淡彩速写</p>
     </header>
 
     {hero_html}
 
     <section class="sketch-box">
       <div class="section-head">
-        <h3>卷一 · 口袋三维钢笔速写台（鼠标拖拽旋转 · 滚轮缩放）</h3>
-        <span>Ink &amp; Wash 3D Active-Site Sketchpad</span>
+        <h3>卷一 · 活性口袋三维构象实时推演台（支持多构象搜寻动画回放与鼠标 360° 拖拽）</h3>
+        <span>Real-Time 3D Conformation Trajectory &amp; Sketchpad</span>
       </div>
       <div class="viewer-bar">
         <label for="poseSelect"><strong>切换标本：</strong></label>
         <select id="poseSelect" onchange="switchPose(this.value)">{option_tags}</select>
-        <button onclick="toggleStyle()">切换画风：钢笔淡彩 / 铅笔线稿</button>
+        <button id="playBtn" class="primary-ink" onclick="togglePlay()">⏸ 暂停实时构象推演</button>
+        <button onclick="stepFrame(-1)">◁ 上一构象帧</button>
+        <button onclick="stepFrame(1)">下一构象帧 ▷</button>
+        <button onclick="toggleStyle()">画风：钢笔淡彩 / 铅笔线稿</button>
         <button onclick="resetCamera()">归位视角</button>
-        <span style="font-size:13px;color:var(--ink-muted);">
-          图例：<b style="color:#2F4860;">● 靛蓝=配体(LIG)</b> &nbsp;|&nbsp;
-          <b style="color:#A8382B;">● 朱砂=催化残基</b> &nbsp;|&nbsp;
-          <b style="color:#B57B28;">● 赭石=辅因子/金属</b> &nbsp;|&nbsp;
-          <b style="color:#655B4E;">● 炭铅=口袋骨架</b>
-        </span>
       </div>
-      <canvas id="molCanvas" width="1100" height="460"></canvas>
+      <div class="timeline-bar">
+        <strong id="frameBadge" style="min-width:260px;color:var(--cinnabar);">正在推演：Mode 1</strong>
+        <input id="frameSlider" type="range" min="0" max="100" value="0" oninput="onSliderInput(this.value)" />
+        <span id="telemetryText" style="font-size:13px;color:var(--ink);font-family:Georgia,serif;"></span>
+      </div>
+      <canvas id="molCanvas" width="1100" height="480"></canvas>
     </section>
 
     <section class="sketch-box">
       <div class="section-head">
-        <h3>卷二 · 对接能量与催化几何评定台账</h3>
+        <h3>卷二 · 对接能量与催化几何评定台账（点击任意行可在上方实时推演该分子）</h3>
         <span>Mechanistic &amp; Thermodynamic Ledger</span>
       </div>
       <p class="guide-caption">
-        <strong>台账判读要领：</strong>凡标有 <strong>【甲等 · 催化合拍】</strong> 且 <strong>Vina 结合能负值更深（如 &lt; -6.0 kcal/mol）</strong> 者，即兼具强结合力与正确反应取向的优选分子。
+        <strong>台账判读要领：</strong>凡标有 <strong>【甲等 · 催化合拍】</strong> 且 <strong>Vina 结合能负值更深（如 &lt; -6.0 kcal/mol）</strong> 者，即兼具强结合力与正确反应取向的优选分子。点击表格中任意一行，上方三维画布将立即切换并实时推演该分子的构象搜寻轨迹。
       </p>
       <div style="overflow-x:auto;">
         <table>
@@ -802,9 +829,6 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
         <h3>卷三 · 配体物化性质与 Lipinski 成药五则</h3>
         <span>Physicochemical &amp; Rule-of-Five Profile</span>
       </div>
-      <p class="guide-caption">
-        <strong>成药五则基准：</strong>分子量 MW ≤ 500 Da，脂水分配系数 LogP ≤ 5，氢键供体 HBD ≤ 5，氢键受体 HBA ≤ 10，极性表面积 TPSA ≤ 140 Å²。
-      </p>
       <div style="overflow-x:auto;">
         <table>
           <thead>
@@ -826,13 +850,59 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
     const POSES = {poses_json_str};
     const canvas = document.getElementById('molCanvas');
     const ctx = canvas.getContext('2d');
+    const frameSlider = document.getElementById('frameSlider');
+    const frameBadge = document.getElementById('frameBadge');
+    const telemetryText = document.getElementById('telemetryText');
+    const playBtn = document.getElementById('playBtn');
+
     let currentKey = Object.keys(POSES)[0] || '';
-    let yaw = 0.45, pitch = 0.30, zoom = 26.0;
+    let yaw = 0.45, pitch = 0.28, zoom = 27.0;
     let dragging = false, lastX = 0, lastY = 0;
     let washMode = true;
+    let isPlaying = true;
+    let animCursor = 0.0; // continuous float index across frames [0 .. frames.length - 1]
+    let holdCounter = 0;
 
-    function switchPose(k) {{ currentKey = k; draw(); }}
-    function resetCamera() {{ yaw = 0.45; pitch = 0.30; zoom = 26.0; draw(); }}
+    function switchPose(k) {{
+      if (!POSES[k]) return;
+      currentKey = k;
+      document.getElementById('poseSelect').value = k;
+      animCursor = 0.0;
+      holdCounter = 0;
+      updateSliderBounds();
+      draw();
+    }}
+
+    function updateSliderBounds() {{
+      const data = POSES[currentKey];
+      const n = (data && data.frames && data.frames.length) ? data.frames.length : 1;
+      frameSlider.max = Math.max(0, (n - 1) * 100);
+      frameSlider.value = Math.round(animCursor * 100);
+    }}
+
+    function togglePlay() {{
+      isPlaying = !isPlaying;
+      playBtn.textContent = isPlaying ? '⏸ 暂停实时构象推演' : '▶ 实时推演构象搜寻全过程';
+    }}
+
+    function stepFrame(delta) {{
+      isPlaying = false;
+      playBtn.textContent = '▶ 实时推演构象搜寻全过程';
+      const data = POSES[currentKey];
+      const n = (data && data.frames && data.frames.length) ? data.frames.length : 1;
+      animCursor = (Math.round(animCursor) + delta + n) % n;
+      frameSlider.value = Math.round(animCursor * 100);
+      draw();
+    }}
+
+    function onSliderInput(val) {{
+      isPlaying = false;
+      playBtn.textContent = '▶ 实时推演构象搜寻全过程';
+      animCursor = parseFloat(val) / 100.0;
+      draw();
+    }}
+
+    function resetCamera() {{ yaw = 0.45; pitch = 0.28; zoom = 27.0; draw(); }}
     function toggleStyle() {{ washMode = !washMode; draw(); }}
 
     canvas.addEventListener('mousedown', e => {{ dragging = true; lastX = e.clientX; lastY = e.clientY; }});
@@ -867,10 +937,9 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       return {{ sx: w * 0.5 + x1 * zoom * persp, sy: h * 0.5 - y2 * zoom * persp, z: z2 }};
     }}
 
-    // Draw a hand-sketched fountain-pen line with two slightly jittered passes
     function sketchLine(x1, y1, x2, y2, color, width, seed) {{
-      const mx = (x1 + x2) * 0.5 + Math.sin(seed * 7.3) * 1.6;
-      const my = (y1 + y2) * 0.5 + Math.cos(seed * 5.1) * 1.6;
+      const mx = (x1 + x2) * 0.5 + Math.sin(seed * 7.3) * 1.5;
+      const my = (y1 + y2) * 0.5 + Math.cos(seed * 5.1) * 1.5;
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
       ctx.lineCap = 'round';
@@ -881,8 +950,8 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
 
       ctx.lineWidth = Math.max(0.7, width * 0.55);
       ctx.beginPath();
-      ctx.moveTo(x1 + 0.7, y1 - 0.5);
-      ctx.quadraticCurveTo(mx - 0.9, my + 0.8, x2 - 0.5, y2 + 0.6);
+      ctx.moveTo(x1 + 0.6, y1 - 0.5);
+      ctx.quadraticCurveTo(mx - 0.8, my + 0.7, x2 - 0.5, y2 + 0.5);
       ctx.stroke();
     }}
 
@@ -898,6 +967,33 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       }}
     }}
 
+    function getInterpolatedLigand(data) {{
+      const frames = (data && data.frames && data.frames.length) ? data.frames : [{{ frame_label: '最优构象', lig: data.lig || [], competent: true }}];
+      const n = frames.length;
+      const idx0 = Math.max(0, Math.min(n - 1, Math.floor(animCursor)));
+      const idx1 = Math.min(n - 1, idx0 + 1);
+      const rawT = animCursor - idx0;
+      // Smoothstep easing for tactile conformational morphing
+      const t = rawT * rawT * (3.0 - 2.0 * rawT);
+      const f0 = frames[idx0];
+      const f1 = frames[idx1];
+      const lig0 = f0.lig || [];
+      const lig1 = f1.lig || lig0;
+      const interpLig = lig0.map((a, i) => {{
+        const b = lig1[i] || a;
+        return {{
+          name: a.name,
+          res: a.res,
+          el: a.el,
+          x: a.x + (b.x - a.x) * t,
+          y: a.y + (b.y - a.y) * t,
+          z: a.z + (b.z - a.z) * t,
+        }};
+      }});
+      const activeFrame = rawT < 0.5 ? f0 : f1;
+      return {{ lig: interpLig, frame: activeFrame, frameIndex: Math.round(animCursor) + 1, totalFrames: n, ghostLig: lig0 }};
+    }}
+
     function drawPaperGrid(w, h) {{
       ctx.fillStyle = '#F4EFE0';
       ctx.fillRect(0, 0, w, h);
@@ -909,15 +1005,13 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       for (let y = 28; y < h; y += 28) {{
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
       }}
-      // Hand-drawn double border inside canvas
       sketchLine(10, 10, w - 10, 10, '#2B2520', 1.4, 1);
       sketchLine(w - 10, 10, w - 10, h - 10, '#2B2520', 1.4, 2);
       sketchLine(w - 10, h - 10, 10, h - 10, '#2B2520', 1.4, 3);
       sketchLine(10, h - 10, 10, 10, '#2B2520', 1.4, 4);
-      // Corner compass / scale mark
       ctx.fillStyle = '#655B4E';
       ctx.font = 'italic 12px Georgia, serif';
-      ctx.fillText('Fig. I — 活性口袋三维钢笔速写 (比例尺: 1 Å)', 22, h - 20);
+      ctx.fillText('Fig. I — 活性口袋三维构象实时搜寻与 L-BFGS-B 精修演进速写 (比例尺: 1 Å)', 22, h - 20);
     }}
 
     function draw() {{
@@ -926,31 +1020,44 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       const data = POSES[currentKey];
       if (!data) return;
       const c = data.center || [0, 0, 0];
+      const state = getInterpolatedLigand(data);
+      const curLig = state.lig;
+      const fInfo = state.frame;
+
+      // Update top timeline UI
+      frameBadge.textContent = `[帧 ${{state.frameIndex}}/${{state.totalFrames}}] ${{fInfo.frame_label || '构象采样'}}`;
+      const vinaStr = fInfo.vina_kcal !== undefined && fInfo.vina_kcal !== '' ? `Vina: ${{fInfo.vina_kcal}} kcal/mol` : '';
+      const dnucStr = fInfo.d_nuc_A !== undefined && fInfo.d_nuc_A !== '' ? ` | d_nuc: ${{fInfo.d_nuc_A}} Å` : '';
+      const angStr = fInfo.angle_deg !== undefined && fInfo.angle_deg !== '' ? ` | 进攻角: ${{fInfo.angle_deg}}°` : '';
+      telemetryText.textContent = vinaStr + dnucStr + angStr;
 
       drawSketchBonds(data.pocket || [], c, w, h, '#7A7062', 1.6, 1.9);
       drawSketchBonds(data.cof || [], c, w, h, '#9C6B21', 2.4, 1.85);
       drawSketchBonds(data.cat || [], c, w, h, '#A8382B', 2.6, 1.95);
-      drawSketchBonds(data.lig || [], c, w, h, '#2B2520', 3.2, 1.88);
+      drawSketchBonds(curLig, c, w, h, '#2B2520', 3.2, 1.88);
 
-      // Dashed ink measurement callout for catalytic attack
+      // Live catalytic attack vector between current interpolated ligand C and catalytic residue
       ctx.save();
       ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = '#A8382B';
-      ctx.lineWidth = 1.6;
-      for (const la of (data.lig || [])) {{
+      ctx.strokeStyle = fInfo.competent ? '#3D6349' : '#A8382B';
+      ctx.lineWidth = 1.8;
+      let minCatDist = 99.9;
+      let bestPair = null;
+      for (const la of curLig) {{
         if (la.el !== 'C') continue;
         for (const ca of (data.cat || [])) {{
           if (['SG','OG','NZ','OD1','OE1'].includes(ca.name)) {{
             const d = dist(la, ca);
-            if (d <= 5.0) {{
-              const p1 = project(la, c, w, h), p2 = project(ca, c, w, h);
-              ctx.beginPath(); ctx.moveTo(p1.sx, p1.sy); ctx.lineTo(p2.sx, p2.sy); ctx.stroke();
-              ctx.fillStyle = '#A8382B';
-              ctx.font = 'italic bold 13px Georgia, serif';
-              ctx.fillText('d_nuc = ' + d.toFixed(2) + ' Å', (p1.sx + p2.sx)*0.5 + 6, (p1.sy + p2.sy)*0.5 - 6);
-            }}
+            if (d < minCatDist) {{ minCatDist = d; bestPair = [la, ca, d]; }}
           }}
         }}
+      }}
+      if (bestPair && bestPair[2] <= 6.5) {{
+        const p1 = project(bestPair[0], c, w, h), p2 = project(bestPair[1], c, w, h);
+        ctx.beginPath(); ctx.moveTo(p1.sx, p1.sy); ctx.lineTo(p2.sx, p2.sy); ctx.stroke();
+        ctx.fillStyle = fInfo.competent ? '#3D6349' : '#A8382B';
+        ctx.font = 'italic bold 13px Georgia, serif';
+        ctx.fillText('d_nuc = ' + bestPair[2].toFixed(2) + ' Å', (p1.sx + p2.sx)*0.5 + 6, (p1.sy + p2.sy)*0.5 - 6);
       }}
       ctx.restore();
 
@@ -958,19 +1065,18 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
       for (const a of (data.pocket || [])) queue.push({{ a, wash: '#C9C0B1', ink: '#5C5346', r: 4.2, lbl: a.name === 'CA' ? a.res : '' }});
       for (const a of (data.cof || [])) queue.push({{ a, wash: '#E6B86A', ink: '#6E4912', r: 5.5, lbl: ['C4N','N5','FE'].includes(a.name) ? a.res+':'+a.name : '' }});
       for (const a of (data.cat || [])) queue.push({{ a, wash: '#D97B6C', ink: '#7A2218', r: 6.5, lbl: ['SG','OG','CA'].includes(a.name) ? a.res+':'+a.name : '' }});
-      for (const a of (data.lig || [])) {{
-        const wash = a.el === 'O' ? '#DF7A6B' : (a.el === 'N' ? '#6D93B0' : '#5B7D95');
+      for (const a of curLig) {{
+        const wash = a.el === 'O' ? '#DF7A6B' : (a.el === 'N' ? '#6D93B0' : (fInfo.is_best_selected ? '#3D6349' : '#5B7D95'));
         queue.push({{ a, wash, ink: '#2B2520', r: 7.5, lbl: a.name }});
       }}
       const proj = queue.map((item, idx) => ({{ ...item, seed: idx, ...project(item.a, c, w, h) }})).sort((x, y) => x.z - y.z);
 
       for (const p of proj) {{
-        // Watercolor wash halo (offset slightly like real hand-painted wash)
         if (washMode) {{
           ctx.beginPath();
           ctx.arc(p.sx + 1.2, p.sy + 1.0, p.r * 1.15, 0, Math.PI * 2);
           ctx.fillStyle = p.wash;
-          ctx.globalAlpha = 0.65;
+          ctx.globalAlpha = 0.68;
           ctx.fill();
           ctx.globalAlpha = 1.0;
         }} else {{
@@ -979,7 +1085,6 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
           ctx.fillStyle = '#F4EFE0';
           ctx.fill();
         }}
-        // Hand-drawn double ink circle outline
         ctx.strokeStyle = p.ink;
         ctx.lineWidth = 1.4;
         ctx.beginPath();
@@ -989,7 +1094,6 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
         ctx.beginPath();
         ctx.arc(p.sx - 0.5, p.sy + 0.4, p.r * 0.96, 0.2, Math.PI * 1.85);
         ctx.stroke();
-        // Hand-hatched shadow crescent inside sphere
         ctx.beginPath();
         ctx.arc(p.sx + p.r * 0.22, p.sy + p.r * 0.22, p.r * 0.62, 0.1, Math.PI * 0.85);
         ctx.stroke();
@@ -1000,8 +1104,60 @@ def generate_visual_html_report(project_root: Path, output_html: Path | None = N
           ctx.fillText(p.lbl, p.sx + p.r + 5, p.sy + 4);
         }}
       }}
+
+      // Draw hand-drawn telemetry stamp card in top-left of canvas
+      ctx.fillStyle = 'rgba(251, 248, 241, 0.92)';
+      ctx.fillRect(20, 20, 310, 74);
+      sketchLine(20, 20, 330, 20, '#2B2520', 1.4, 11);
+      sketchLine(330, 20, 330, 94, '#2B2520', 1.4, 12);
+      sketchLine(330, 94, 20, 94, '#2B2520', 1.4, 13);
+      sketchLine(20, 94, 20, 20, '#2B2520', 1.4, 14);
+      ctx.fillStyle = '#2B2520';
+      ctx.font = 'bold 13.5px "Songti SC", Georgia, serif';
+      ctx.fillText(`标本: ${{currentKey}} · ${{fInfo.frame_label || ''}}`, 30, 42);
+      ctx.font = '12.5px Georgia, serif';
+      ctx.fillStyle = '#655B4E';
+      ctx.fillText(`Vina: ${{fInfo.vina_kcal || '-'}} kcal/mol  |  d_nuc: ${{minCatDist < 90 ? minCatDist.toFixed(2) : '-'}} Å`, 30, 63);
+      ctx.fillStyle = fInfo.is_best_selected ? '#3D6349' : (fInfo.competent ? '#B57B28' : '#A8382B');
+      ctx.font = 'bold 12px "Songti SC", serif';
+      ctx.fillText(fInfo.is_best_selected ? '印记：【最优催化构象 · 已锁定】' : (fInfo.competent ? '印记：【满足催化几何 · 候选】' : '印记：【构象空间搜寻采样中...】'), 30, 83);
     }}
+
+    function tick() {{
+      if (isPlaying) {{
+        const data = POSES[currentKey];
+        const n = (data && data.frames && data.frames.length) ? data.frames.length : 1;
+        if (!dragging) {{
+          yaw += 0.0035;
+        }}
+        if (n > 1) {{
+          const curNearest = Math.round(animCursor);
+          const isBest = data.frames[curNearest] && data.frames[curNearest].is_best_selected;
+          if (Math.abs(animCursor - curNearest) < 0.02 && isBest && holdCounter < 45) {{
+            holdCounter += 1;
+          }} else {{
+            holdCounter = 0;
+            animCursor += 0.018;
+            if (animCursor >= n - 1) {{
+              if (holdCounter < 55) {{
+                animCursor = n - 1;
+                holdCounter += 1;
+              }} else {{
+                animCursor = 0.0;
+                holdCounter = 0;
+              }}
+            }}
+          }}
+          frameSlider.value = Math.round(animCursor * 100);
+        }}
+        draw();
+      }}
+      requestAnimationFrame(tick);
+    }}
+
+    updateSliderBounds();
     draw();
+    requestAnimationFrame(tick);
   </script>
 </body>
 </html>

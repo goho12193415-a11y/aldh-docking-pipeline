@@ -1,9 +1,16 @@
-# ALDH_Docking_Pipeline Universal Technical Dossier (`v8.5`)
+# ALDH_Docking_Pipeline Universal Technical Dossier (`v9.0`)
 
-## 1. Executive Summary (`v8.5` Sketchbook Release)
-`ALDH_Docking_Pipeline` (`v8.5`) is a self-contained, zero-human-intervention, universal molecular docking, mechanism-aware rescoring, and post-docking refinement platform. Across `v4.0`–`v8.5`, the algorithmic, physical and workflow bottlenecks are verified by **63 automated unit tests**:
+## 1. Executive Summary (`v9.0` Live3D Release)
+`ALDH_Docking_Pipeline` (`v9.0`) is a self-contained, zero-human-intervention, universal molecular docking, mechanism-aware rescoring, and post-docking refinement platform. Across `v4.0`–`v9.0`, the algorithmic, physical and workflow bottlenecks are verified by **66 automated unit tests**:
 
-### `v8.5` New Capabilities (Sketchbook Release)
+### `v9.0` New Capabilities (Live3D Release)
+1. **Multi-mode trajectory export**: `score_docking()` writes `reports/active_poses/<ligand>_trajectory.json` with up to 12 Vina search modes (`vina_mode_search`) plus the L-BFGS-B refined final frame (`lbfgsb_refined_final`).
+2. **Live pose stream**: `main.py` updates `reports/live_pose_stream.json` after each ligand; the GUI's right-hand 3D canvas follows the current receptor/ligand/pose/trajectory while the batch runs.
+3. **HTML conformation player**: the standalone report embeds a frame-interpolating 3D viewer (`getInterpolatedLigand`) that can replay mode search and the refinement endpoint directly in the browser.
+
+> The "trajectory" is a visual replay of docking modes and the refinement endpoint, **not** an MD time series.
+
+### `v8.5` Capabilities Retained (Sketchbook Release)
 1. **3D ligand formats**: native MOL2/SDF/MOL/PDB/PDBQT input with automatic desalting and fragment extraction (`src/step1_ligand_prep.py`).
 2. **Multi-receptor discovery**: `discover_raw_receptors()` expands CLI/config/`data/01_raw_receptors/*.pdb`, runs an ensemble, and records each receptor in the execution plan (`main.py`).
 3. **ADMET profiling**: Lipinski/Veber/QED descriptors written to `reports/admet_druglikeness.csv` (`src/common.py`).
@@ -41,6 +48,6 @@
 - Hungarian algorithm (`scipy.optimize.linear_sum_assignment`) symmetry-corrected 3D RMSD and `--workers` multi-threaded execution.
 
 ## 2. Verification & Validation Summary
-- **Unit Test Suite**: `python3 -m unittest discover -s tests -v` — **63 / 63 tests pass**.
+- **Unit Test Suite**: `python3 -m unittest discover -s tests -v` — **66 / 66 tests pass**.
 - **Pipeline End-to-End Execution**: `python3 main.py --config config/pipeline_config.yaml --workers 2` — completes all stages and writes SQLite run history, CSV summaries, and PyMOL visualization scripts.
 - **Artifact Integrity Check**: `python3 scripts/validate_outputs.py` — passes with zero missing outputs.

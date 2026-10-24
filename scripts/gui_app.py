@@ -475,17 +475,44 @@ class DockingWorkbench(tk.Tk):
         ):
             ttk.Button(row, text=text, style="Secondary.TButton", command=command).pack(side="left", padx=(0, 6))
 
-        log_frame = ttk.Frame(lower, style="Card.TFrame", padding=10)
+        split_bottom = ttk.PanedWindow(lower, orient="horizontal")
+        log_frame = ttk.Frame(split_bottom, style="Card.TFrame", padding=10)
         log_frame.rowconfigure(1, weight=1)
         log_frame.columnconfigure(0, weight=1)
         ttk.Label(log_frame, text="实验过程笔录", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.log = tk.Text(log_frame, wrap="none", state="disabled", bg="#FAF5E8", fg="#2B2520", insertbackground="#FFFFFF", relief="flat", padx=12, pady=8, height=10, font=("Consolas", 9))
+        self.log = tk.Text(log_frame, wrap="none", state="disabled", bg="#FAF5E8", fg="#2B2520", insertbackground="#2B2520", relief="flat", padx=12, pady=8, height=10, font=("Consolas", 9))
         self.log.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         scroll.grid(row=1, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set)
+
+        live_3d_frame = ttk.Frame(split_bottom, style="Card.TFrame", padding=10)
+        live_3d_frame.rowconfigure(1, weight=1)
+        live_3d_frame.columnconfigure(0, weight=1)
+        live_hdr = ttk.Frame(live_3d_frame, style="Card.TFrame")
+        live_hdr.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.live_3d_title_var = tk.StringVar(value="实时三维构象演进速写窗（运行或选定标本时自动推演）")
+        ttk.Label(live_hdr, textvariable=self.live_3d_title_var, style="Section.TLabel").pack(side="left")
+        ttk.Button(live_hdr, text="▶ 回放构象搜寻", style="Secondary.TButton", command=self._replay_live_trajectory).pack(side="right")
+        self.live_canvas = tk.Canvas(live_3d_frame, bg="#F4EFE0", height=210, width=440, highlightthickness=1, highlightbackground="#2B2520", cursor="fleur")
+        self.live_canvas.grid(row=1, column=0, sticky="nsew")
+        self.live_yaw = 0.45
+        self.live_pitch = 0.28
+        self.live_zoom = 18.0
+        self.live_frames: list[dict] = []
+        self.live_frame_idx = 0
+        self.live_cat_atoms: list[dict] = []
+        self.live_pocket_atoms: list[dict] = []
+        self.live_center = np.zeros(3, dtype=float)
+        self.live_canvas.bind("<ButtonPress-1>", lambda e: setattr(self, "_live_mouse", (e.x, e.y)))
+        self.live_canvas.bind("<B1-Motion>", self._on_live_drag)
+
+        split_bottom.add(log_frame, weight=1)
+        split_bottom.add(live_3d_frame, weight=1)
         lower.add(actions, weight=0)
-        lower.add(log_frame, weight=1)
+        lower.add(split_bottom, weight=1)
+        self.after(250, self._init_default_live_preview)
+        self.after(180, self._tick_live_canvas)
 
         self._switch_page("quick")
 
@@ -618,6 +645,131 @@ class DockingWorkbench(tk.Tk):
         tree.grid(row=1, column=0, sticky="ew")
         self.results_tree = tree
         self.pages["results"] = page
+
+    def _on_live_drag(self, event) -> None:
+        lx, ly = getattr(self, "_live_mouse", (event.x, event.y))
+        self._live_mouse = (event.x, event.y)
+        self.live_yaw += (event.x - lx) * 0.012
+        self.live_pitch = max(-1.45, min(1.45, self.live_pitch + (event.y - ly) * 0.012))
+        self._draw_live_canvas()
+
+    def _init_default_live_preview(self) -> None:
+        stream_path = Path(self.root_var.get()) / "reports" / "live_pose_stream.json"
+        if stream_path.is_file():
+            try:
+                payload = json.loads(stream_path.read_text(encoding="utf-8"))
+                self._load_live_pose_payload(payload)
+            except Exception:
+                pass
+
+    def _replay_live_trajectory(self) -> None:
+        self.live_frame_idx = 0
+        self._draw_live_canvas()
+
+    def _load_live_pose_payload(self, payload: dict) -> None:
+        pose_path = Path(str(payload.get("active_pose", "")))
+        traj_path = Path(str(payload.get("trajectory_json", "")))
+        lig_name = str(payload.get("ligand", "Ligand"))
+        if not pose_path.is_file():
+            return
+        cat_num = int(self.cat_res_num_var.get().strip() or 302)
+        lig_atoms, cat_atoms, rec_atoms = [], [], []
+        for line in pose_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            a = atom_dict(line)
+            if a["element"].upper() == "H":
+                continue
+            if a["resname"] == "LIG":
+                lig_atoms.append(a)
+            elif a["resseq"] == cat_num:
+                cat_atoms.append(a)
+            else:
+                rec_atoms.append(a)
+        if lig_atoms:
+            self.live_center = np.mean([a["coord"] for a in lig_atoms], axis=0)
+        self.live_cat_atoms = cat_atoms
+        self.live_pocket_atoms = [
+            a for a in rec_atoms
+            if distance(a["coord"], self.live_center) <= 5.8 and a["name"] in {"CA", "CB", "CG", "ND2", "SG", "OG"}
+        ][:45]
+        frames = []
+        if traj_path.is_file():
+            try:
+                tdata = json.loads(traj_path.read_text(encoding="utf-8"))
+                frames = tdata.get("frames", [])
+            except Exception:
+                frames = []
+        if not frames and lig_atoms:
+            frames = [{
+                "frame_label": f"{lig_name} 最优构象",
+                "vina_kcal": payload.get("vina_kcal", ""),
+                "d_nuc_A": payload.get("d_nuc_A", ""),
+                "competent": payload.get("competent", True),
+                "lig": [{"name": a["name"], "el": a["element"].upper(), "x": float(a["coord"][0]), "y": float(a["coord"][1]), "z": float(a["coord"][2])} for a in lig_atoms],
+            }]
+        self.live_frames = frames
+        self.live_frame_idx = 0
+        self.live_3d_title_var.set(f"实时三维构象速写：{lig_name} (共 {len(frames)} 帧演进)")
+        self._draw_live_canvas()
+
+    def _tick_live_canvas(self) -> None:
+        if self.live_frames:
+            self.live_yaw += 0.015
+            if len(self.live_frames) > 1:
+                self.live_frame_idx = (self.live_frame_idx + 1) % len(self.live_frames)
+            self._draw_live_canvas()
+        self.after(420, self._tick_live_canvas)
+
+    def _draw_live_canvas(self) -> None:
+        if not hasattr(self, "live_canvas"):
+            return
+        c = self.live_canvas
+        c.delete("all")
+        w = max(260, c.winfo_width())
+        h = max(160, c.winfo_height())
+        for gx in range(24, w, 24):
+            c.create_line(gx, 0, gx, h, fill="#E5DEC9", width=1)
+        for gy in range(24, h, 24):
+            c.create_line(0, gy, w, gy, fill="#E5DEC9", width=1)
+        if not self.live_frames:
+            c.create_text(w * 0.5, h * 0.5, text="等待构象数据流...", fill="#655B4E", font=("Georgia", 10, "italic"))
+            return
+        frame = self.live_frames[self.live_frame_idx % len(self.live_frames)]
+        lig_pts = frame.get("lig", [])
+
+        def _proj(pt_arr: np.ndarray) -> tuple[float, float, float]:
+            rel = pt_arr - self.live_center
+            cy, sy = math.cos(self.live_yaw), math.sin(self.live_yaw)
+            cp, sp = math.cos(self.live_pitch), math.sin(self.live_pitch)
+            x1 = rel[0] * cy - rel[2] * sy
+            z1 = rel[0] * sy + rel[2] * cy
+            y2 = rel[1] * cp - z1 * sp
+            z2 = rel[1] * sp + z1 * cp
+            persp = 40.0 / max(14.0, 40.0 - z2)
+            return w * 0.5 + x1 * self.live_zoom * persp, h * 0.5 - y2 * self.live_zoom * persp, z2
+
+        for pa in self.live_pocket_atoms:
+            sx, sy, _ = _proj(pa["coord"])
+            c.create_oval(sx - 3, sy - 3, sx + 3, sy + 3, fill="#C9C0B1", outline="#5C5346")
+        for ca in self.live_cat_atoms:
+            sx, sy, _ = _proj(ca["coord"])
+            c.create_oval(sx - 5, sy - 5, sx + 5, sy + 5, fill="#D97B6C", outline="#2B2520")
+
+        coords_l = [np.array([p["x"], p["y"], p["z"]], dtype=float) for p in lig_pts]
+        for i in range(len(coords_l)):
+            for j in range(i + 1, len(coords_l)):
+                if distance(coords_l[i], coords_l[j]) <= 1.88:
+                    x1, y1, _ = _proj(coords_l[i])
+                    x2, y2, _ = _proj(coords_l[j])
+                    _canvas_sketch_line(c, x1, y1, x2, y2, "#2B2520", 2, i * 19 + j)
+        for p, arr in zip(lig_pts, coords_l):
+            sx, sy, _ = _proj(arr)
+            col = "#DF7A6B" if p.get("el") == "O" else "#5B7D95"
+            c.create_oval(sx - 6, sy - 6, sx + 6, sy + 6, fill=col, outline="#2B2520", width=1.5)
+
+        lbl_txt = f"[{self.live_frame_idx + 1}/{len(self.live_frames)}] {frame.get('frame_label', '')} | Vina: {frame.get('vina_kcal', '')} | d_nuc: {frame.get('d_nuc_A', '')} Å"
+        c.create_text(10, h - 12, text=lbl_txt, anchor="w", fill="#2B2520", font=("Georgia", 9, "bold"))
 
     def _open_html_report(self) -> None:
         root = Path(self.root_var.get())
@@ -923,7 +1075,15 @@ class DockingWorkbench(tk.Tk):
             while True:
                 kind, value = self.messages.get_nowait()
                 if kind == "log":
-                    self._append(str(value))
+                    line_str = str(value)
+                    self._append(line_str)
+                    if "[LIVE_3D_POSE]" in line_str:
+                        try:
+                            payload_str = line_str.split("[LIVE_3D_POSE]", 1)[1].strip()
+                            payload = json.loads(payload_str)
+                            self._load_live_pose_payload(payload)
+                        except Exception:
+                            pass
                 elif kind == "done":
                     self.status_var.set("已完成" if value == "0" else f"失败（退出码 {value}）")
                     self._refresh_gate()

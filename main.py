@@ -737,6 +737,24 @@ def run(
             )
         else:
             refinement_info = {"refined": False, "reason": "disabled_by_config"}
+        # Emit a real-time 3D pose stream checkpoint so GUI and browser viewers
+        # can render conformations while the batch is still running.
+        with _SUMMARY_LOCK:
+            live_stream_path = root / "reports" / "live_pose_stream.json"
+            live_payload = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "receptor": receptor_input.stem,
+                "ligand": ligand["name"],
+                "active_pose": str(refined_pose_path if refined_pose_path.is_file() else summary["active_pose"]),
+                "trajectory_json": str(summary.get("trajectory_json", "")),
+                "vina_kcal": summary.get("Binding_Affinity_kcal_mol", ""),
+                "physchem_kcal": summary.get("PhysChem_Score_kcal_mol", ""),
+                "d_nuc_A": summary.get("d_nuc_A", ""),
+                "competent": bool(summary.get("Catalytically_Competent")),
+                "grade": summary.get("Reliability_Grade", ""),
+            }
+            live_stream_path.write_text(json.dumps(live_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            LOGGER.info("[LIVE_3D_POSE] %s", json.dumps(live_payload, ensure_ascii=False))
         # The heuristic refinement score is not a physical energy, so the refined
         # pose only replaces the docked pose when the user explicitly opts in.
         if (

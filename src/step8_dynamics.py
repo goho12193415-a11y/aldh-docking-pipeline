@@ -194,6 +194,42 @@ def refine_active_pose_in_pocket(
             f"HETATM{atom['serial']:5d} {atom['name'][:4]:>4s} LIG L{999:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2s}"
         )
     output_pdb.write_text("\n".join(protein_lines + refined_lig_lines + ["END"]) + "\n", encoding="utf-8")
+    traj_candidate = complex_pdb.with_name(complex_pdb.stem.replace("_active", "") + "_trajectory.json")
+    if traj_candidate.is_file():
+        try:
+            tdata = json.loads(traj_candidate.read_text(encoding="utf-8"))
+            ref_lig_pts = []
+            for idx, atom in enumerate(ligand_atoms):
+                el = atom["element"].strip().upper()[:2]
+                if el == "H":
+                    continue
+                x, y, z = coords_opt[idx]
+                ref_lig_pts.append({
+                    "name": atom["name"][:4],
+                    "res": "LIG999",
+                    "el": el,
+                    "x": round(float(x), 3),
+                    "y": round(float(y), 3),
+                    "z": round(float(z), 3),
+                })
+            d_nuc_ref = round(float(np.min(np.linalg.norm(coords_opt - cat_coord[None, :], axis=1))), 3) if cat_coord is not None else ""
+            tdata.setdefault("frames", []).append({
+                "frame_label": f"L-BFGS-B 精修终态 (Δscore={round(e_init - e_final, 2)}，无量纲)",
+                "mode": int(tdata.get("selected_mode", 1)),
+                "stage": "lbfgsb_refined_final",
+                "is_best_selected": True,
+                "competent": bool(tdata["frames"][0].get("competent", False)) if tdata.get("frames") else False,
+                "vina_kcal": tdata["frames"][0].get("vina_kcal", "") if tdata.get("frames") else "",
+                "refine_score": round(e_final, 3),
+                "d_nuc_A": d_nuc_ref,
+                "d_hyd_A": tdata["frames"][0].get("d_hyd_A", "") if tdata.get("frames") else "",
+                "angle_deg": tdata["frames"][0].get("angle_deg", "") if tdata.get("frames") else "",
+                "lig": ref_lig_pts,
+            })
+            tdata["frame_count"] = len(tdata["frames"])
+            traj_candidate.write_text(json.dumps(tdata, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     return {
         "refined": True,
         "refined_pdb": str(output_pdb),

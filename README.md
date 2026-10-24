@@ -135,6 +135,14 @@ python scripts/validate_outputs.py
 
 同时生成 `reports/capability_report.json`，给出本次配置实际支持的声明、不能支持的声明，以及 `allow_initial_screening`、`allow_with_review` 或 `block_interpretation` 建议。这样“程序能运行”和“结果能解释”被明确分开。
 
+## Live3D 实时构象
+
+v9 增加了运行期与报告期的三维构象回放，但它**不是 MD 轨迹**：帧来自 Vina 的多 mode 搜索结果和 L-BFGS-B 精修终态，用于观察构象如何收敛，不代表时间演化。
+
+- `reports/active_poses/<ligand>_trajectory.json`：最多 12 个 `vina_mode_search` 帧 + 1 个 `lbfgsb_refined_final` 帧，含每帧配体坐标、Vina 分数、物化分数、d_nuc/d_hyd/角度和合格标记。
+- `reports/live_pose_stream.json`：每个配体完成后更新一次，记录当前受体、配体、pose、轨迹文件、分数和可靠性等级。
+- GUI 右下角的“实时三维构象演进速写窗”会跟随该文件刷新；HTML 报告内嵌 `getInterpolatedLigand` 帧间插值播放器，可点击表格行切换分子。
+
 ## 当前自动化改进层
 
 每次运行还会生成以下可追溯审计文件：

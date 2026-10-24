@@ -1266,5 +1266,62 @@ ATOM 6 S SG . CYS A 302 4.750 1.100 1.900 1.00 15.00 1
             self.assertNotIn("Pi_Stacking", types)
 
 
+    def test_multi_mode_3d_trajectory_json_is_exported_with_lbfgsb_final_frame(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            receptor_path = root / "receptor.pdb"
+            receptor_path.write_text("\n".join([
+                _pdb_atom("ATOM", 1, "SG", "CYS", "A", 302, 7.0, 0, 0, "S"),
+                "END",
+            ]) + "\n", encoding="utf-8")
+            docking_path = root / "out.pdbqt"
+            docking_path.write_text("\n".join([
+                "REMARK VINA RESULT: -8.0 0.000 0.000",
+                "MODEL        1",
+                _pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 0, 0, 0, "OA"),
+                _pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 1.2, 0, 0, "C"),
+                "ENDMDL",
+                "REMARK VINA RESULT: -6.0 0.000 0.000",
+                "MODEL        2",
+                _pdb_atom("ATOM", 1, "OA", "LIG", "L", 999, 2.3, 0, 0, "OA"),
+                _pdb_atom("ATOM", 2, "C1", "LIG", "L", 999, 3.5, 0, 0, "C"),
+                "ENDMDL",
+            ]) + "\n", encoding="utf-8")
+            config = {
+                "receptor": {"catalytic_residue": {"number": 302, "chain": "A"}},
+                "thresholds": {
+                    "carbonyl_bond_min": 1.15, "carbonyl_bond_max": 1.35,
+                    "d_nuc_min": 3.0, "d_nuc_max": 4.5,
+                },
+            }
+            result = score_docking(docking_path, receptor_path, "Hexanal", config, root / "reports")
+            traj_path = Path(result["trajectory_json"])
+            self.assertTrue(traj_path.is_file())
+            refine_active_pose_in_pocket(Path(result["active_pose"]))
+            data = json.loads(traj_path.read_text(encoding="utf-8"))
+            self.assertGreaterEqual(data["frame_count"], 3)
+            stages = [f["stage"] for f in data["frames"]]
+            self.assertIn("vina_mode_search", stages)
+            self.assertIn("lbfgsb_refined_final", stages)
+
+    def test_live_pose_stream_checkpoint_is_written_during_run(self):
+        project_root = Path(__file__).resolve().parents[1]
+        live_path = project_root / "reports" / "live_pose_stream.json"
+        if not live_path.is_file():
+            self.skipTest("requires a completed pipeline run to inspect its live checkpoint")
+        payload = json.loads(live_path.read_text(encoding="utf-8"))
+        self.assertIn("ligand", payload)
+        self.assertIn("trajectory_json", payload)
+
+    def test_html_report_embeds_multi_frame_3d_conformation_trajectory_player(self):
+        project_root = Path(__file__).resolve().parents[1]
+        html_path = generate_visual_html_report(project_root)
+        html_text = html_path.read_text(encoding="utf-8")
+        self.assertIn("getInterpolatedLigand", html_text)
+        traj_files = list((project_root / "reports" / "active_poses").glob("*_trajectory.json"))
+        if traj_files:
+            self.assertIn("lbfgsb_refined_final", html_text)
+
+
 if __name__ == "__main__":
     unittest.main()

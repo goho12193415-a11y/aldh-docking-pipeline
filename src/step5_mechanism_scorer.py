@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import math
 from pathlib import Path
@@ -623,4 +624,50 @@ def score_docking(
     protein_lines = merge_receptor_and_flex(receptor_atoms, best_flex)
     active_path.write_text("\n".join(protein_lines + clean_ligand_pdbqt(best_model)) + "\nEND\n", encoding="utf-8")
     best_row["active_pose"] = str(active_path)
+
+    # Export multi-mode 3D search trajectory frames for real-time 3D visualization & replay
+    trajectory_frames = []
+    for r_dict, m_atoms, _ in rows[:12]:
+        lig_pts = []
+        for idx_a, a in enumerate(m_atoms, 1):
+            el = {"OA": "O", "NA": "N", "SA": "S", "HD": "H", "A": "C"}.get(a["name"], a["element"][:1].upper())
+            if el == "H":
+                continue
+            lig_pts.append({
+                "name": a["name"][:4] or f"{el}{idx_a}",
+                "res": "LIG999",
+                "el": el,
+                "x": round(float(a["coord"][0]), 3),
+                "y": round(float(a["coord"][1]), 3),
+                "z": round(float(a["coord"][2]), 3),
+            })
+        trajectory_frames.append({
+            "frame_label": f"Mode {r_dict['Mode']} ({'构象支持' if r_dict['Catalytically_Competent'] else '构象采样'})",
+            "mode": int(r_dict["Mode"]),
+            "stage": "vina_mode_search",
+            "is_best_selected": bool(r_dict["Mode"] == best_row["Mode"]),
+            "competent": bool(r_dict["Catalytically_Competent"]),
+            "vina_kcal": r_dict["Binding_Affinity_kcal_mol"],
+            "physchem_kcal": r_dict["PhysChem_Score_kcal_mol"],
+            "d_nuc_A": r_dict["d_nuc_A"],
+            "d_hyd_A": r_dict["d_hyd_A"],
+            "angle_deg": r_dict["Burgi_Dunitz_Angle_deg"],
+            "lig": lig_pts,
+        })
+
+    traj_path = reports_dir / "active_poses" / f"{ligand_name}_trajectory.json"
+    traj_path.write_text(
+        json.dumps(
+            {
+                "ligand": ligand_name,
+                "selected_mode": int(best_row["Mode"]),
+                "frame_count": len(trajectory_frames),
+                "frames": trajectory_frames,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    best_row["trajectory_json"] = str(traj_path)
     return best_row
